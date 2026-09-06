@@ -380,8 +380,13 @@ mod tests {
         started_rx.await.expect("blocking write started");
         first.abort();
         assert!(first.await.is_err(), "canceled write must not complete");
+        assert_eq!(
+            shared.semaphore.available_permits(),
+            0,
+            "the canceled worker must retain the write permit"
+        );
 
-        let mut second = tokio::spawn({
+        let second = tokio::spawn({
             let shared = shared.clone();
             async move {
                 shared
@@ -396,11 +401,10 @@ mod tests {
                     .await
             }
         });
+        tokio::task::yield_now().await;
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(25), &mut second)
-                .await
-                .is_err(),
-            "the canceled worker must retain the write permit"
+            !second.is_finished(),
+            "the second write must await the permit"
         );
         release_tx.send(()).expect("release blocking write");
         second.await.expect("second join").expect("second write");
