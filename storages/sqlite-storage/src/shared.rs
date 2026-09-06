@@ -353,6 +353,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn canceling_blocking_write_keeps_permit_until_worker_finishes() {
+        use tokio::sync::oneshot;
+
+        let store = create_test_store("cancel_blocking_write").await;
+        let shared = store.shared();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let first = tokio::spawn({
+            let shared = shared.clone();
+            async move {
+                shared
+                    .run(move |conn| {
+                        diesel::sql_query("CREATE TABLE canceled_data (value TEXT)")
+                            .execute(conn)
+                            .map_err(db_err)?;
+                        let _ = started_tx.send(());
+                        release_rx
+                            .blocking_recv()
+                            .map_err(|_| StoreError::Validation("write release dropped".into()))?;
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+        started_rx.await.expect("blocking write started");
+        first.abort();
+        assert!(first.await.is_err(), "canceled write must not complete");
+
+        let mut second = tokio::spawn({
+            let shared = shared.clone();
+            async move {
+                shared
+                    .run(|conn| {
+                        diesel::sql_query(
+                            "INSERT INTO canceled_data (value) VALUES ('after-cancel')",
+                        )
+                        .execute(conn)
+                        .map_err(db_err)?;
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut second)
+                .await
+                .is_err(),
+            "the canceled worker must retain the write permit"
+        );
+        release_tx.send(()).expect("release blocking write");
+        second.await.expect("second join").expect("second write");
+    }
+
+    #[tokio::test]
     async fn signal_batch_surfaces_barrier_error() {
         use crate::sqlite_store::{CommitBarrierHook, SqliteStoreConfig};
         use bytes::Bytes;
