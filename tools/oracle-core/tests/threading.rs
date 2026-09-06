@@ -26,14 +26,7 @@ const QUIESCE: Duration = Duration::from_secs(2);
 /// deadlines, which surfaces as an unrelated-looking failure rather than as
 /// contention. The lock is poison-tolerant: a panicking test must not cascade
 /// into every test after it.
-fn threaded_guard() -> (std::sync::MutexGuard<'static, ()>, common::EngineLock) {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    // Both locks: the mutex serialises this binary's tests, and the port
-    // serialises against the *other* test binaries, which cargo runs in
-    // parallel with this one.
-    let guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    (guard, common::engine_lock())
-}
+use common::threaded_guard;
 
 /// A VoIP module initialised under the given thread policy.
 fn engine(policy: ThreadPolicy) -> Option<Runtime> {

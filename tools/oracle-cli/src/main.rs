@@ -432,7 +432,9 @@ fn run_wasi(
         runtime.add_file(&guest, contents);
     }
     if opts.log {
-        runtime.attach_log_ring(1 << 20).ok();
+        runtime
+            .attach_log_ring(1 << 20)
+            .context("requested --log is unavailable for this module")?;
     }
 
     let code = runtime.run_main()?;
@@ -441,8 +443,8 @@ fn run_wasi(
 
     for spec in outputs {
         let (guest, host) = split_mapping(spec);
-        let contents = runtime
-            .wasi()
+        let wasi = runtime.wasi();
+        let contents = wasi
             .file(&guest)
             .ok_or_else(|| anyhow::anyhow!("guest wrote no file `{guest}`"))?;
         std::fs::write(&host, contents).with_context(|| format!("writing {host}"))?;
@@ -1196,6 +1198,30 @@ fn carry(catalog: &Catalog, old: &str, new: &str, indices: &[u32]) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_reports_unsupported_logging_before_executing_the_command() {
+        let directory =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.cache/oracle-cli-tests");
+        std::fs::create_dir_all(&directory).unwrap();
+        let module = directory.join("no-log.wasm");
+        std::fs::write(&module, b"\0asm\x01\0\0\0").unwrap();
+        let catalog = Catalog::from_dir(&directory).unwrap();
+        let args = Cli::try_parse_from(["oracle", "run", "no-log", "--log"]).unwrap();
+        let Command::Run {
+            target,
+            args,
+            files,
+            outputs,
+            engine,
+        } = args.command
+        else {
+            panic!("run command")
+        };
+        let error = run_wasi(&catalog, &target, &args, &files, &outputs, &engine).unwrap_err();
+        assert!(format!("{error:#}").contains("requested --log is unavailable"));
+        std::fs::remove_file(module).unwrap();
+    }
 
     /// A malformed typed argument is an error, not a default.
     ///

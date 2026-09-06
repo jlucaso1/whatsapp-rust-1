@@ -88,32 +88,26 @@ impl EmvalTable {
 /// how to interpret them.
 ///
 /// `readValueFromPointer` in embind dispatches on the registered type; the type
-/// name is the only description available here, so it is what decides.
-fn read_through_pointer(state: &HostState, type_name: &str, ptr: u32) -> Option<Value> {
-    let read_int = |width: u32, signed: bool| -> Option<Value> {
-        let bytes = state.read(ptr, width).ok()?;
-        let mut buf = [0u8; 8];
-        buf[..bytes.len()].copy_from_slice(&bytes);
-        let raw = u64::from_le_bytes(buf);
-        Some(Value::Int(if signed {
-            // Sign-extend from the type's own width.
-            let shift = 64 - width * 8;
-            ((raw << shift) as i64) >> shift
-        } else {
-            raw as i64
-        }))
-    };
+/// registration supplies integer width/signedness; known names cover primitives.
+fn read_through_pointer(
+    state: &HostState,
+    type_id: u32,
+    type_name: &str,
+    ptr: u32,
+) -> Option<Value> {
+    if let Some(integer) = state
+        .embind
+        .integer_type(type_id)
+        .or_else(|| crate::integer::IntegerType::named(type_name))
+    {
+        let bytes = state.read(ptr, u32::from(integer.bytes())).ok()?;
+        let mut buffer = [0; 8];
+        buffer[..bytes.len()].copy_from_slice(&bytes);
+        return Some(integer.decode(u64::from_le_bytes(buffer)));
+    }
 
     match type_name {
         "bool" => Some(Value::Bool(state.read(ptr, 1).ok()?[0] != 0)),
-        "char" | "signed char" => read_int(1, true),
-        "unsigned char" => read_int(1, false),
-        "short" => read_int(2, true),
-        "unsigned short" => read_int(2, false),
-        "int" | "long" => read_int(4, true),
-        "unsigned int" | "unsigned long" => read_int(4, false),
-        "int64_t" | "long long" => read_int(8, true),
-        "uint64_t" | "unsigned long long" => read_int(8, false),
         "float" => {
             let bytes = state.read(ptr, 4).ok()?;
             Some(Value::Double(
@@ -159,7 +153,7 @@ pub fn define(
 
                     let state = caller.data();
                     let type_name = state.embind.type_name(type_id);
-                    let value = read_through_pointer(state, &type_name, ptr);
+                    let value = read_through_pointer(state, type_id, &type_name, ptr);
 
                     let handle = match value {
                         Some(value) => caller.data_mut().emval.insert(value),

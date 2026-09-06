@@ -4,17 +4,12 @@
 //! ground truth, the Rust side supplies the candidate, and the test asserts they
 //! agree over a range of inputs rather than at a single point.
 
-use oracle_core::{Catalog, Runtime, Value};
+use oracle_core::{Runtime, Value};
 use wasmtime::Val;
 
 mod common;
 
-static THREADED: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn threaded_guard() -> (std::sync::MutexGuard<'static, ()>, common::EngineLock) {
-    let local = THREADED.lock().unwrap_or_else(|error| error.into_inner());
-    (local, common::engine_lock())
-}
+use common::threaded_guard;
 
 /// The capture these comparisons treat as ground truth. Named once: see the
 /// note on the same constant in `abi_inference.rs`.
@@ -30,20 +25,9 @@ fn as_i32(results: &[Val]) -> Option<i32> {
 }
 
 fn module(id: &str) -> anyhow::Result<Option<Runtime>> {
-    let catalog = match Catalog::discover() {
-        Ok(catalog) => catalog,
-        Err(error)
-            if std::env::var_os(oracle_core::catalog::DIR_ENV).is_none()
-                && error
-                    .to_string()
-                    .starts_with("no directory holding captured .wasm files") =>
-        {
-            return Ok(None);
-        }
-        Err(error) => return Err(error),
+    let Some(bytes) = common::capture(id)? else {
+        return Ok(None);
     };
-    let entry = catalog.resolve(id)?;
-    let bytes = std::fs::read(&entry.path)?;
     Runtime::instantiate(&bytes).map(Some)
 }
 

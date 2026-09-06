@@ -17,6 +17,7 @@ use anyhow::Result;
 use wasmtime::error::Context as _;
 use wasmtime::{Caller, Linker, Module, Store, Val};
 
+use crate::integer::IntegerType;
 use crate::state::HostState;
 
 /// A free function the module registered with embind.
@@ -140,12 +141,6 @@ pub struct EmbindRegistry {
     orphan_properties: Vec<EmbindProperty>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct IntegerType {
-    pub bytes: u32,
-    pub signed: bool,
-}
-
 impl EmbindRegistry {
     /// Whether nothing was registered at all, which is the correct answer for
     /// a module that exposes plain C exports instead.
@@ -248,12 +243,14 @@ impl EmbindRegistry {
 }
 
 /// Reads `count` type ids from an array of 32-bit ids.
-fn read_type_ids(state: &HostState, ptr: u32, count: u32) -> Vec<u32> {
-    const MAX: u32 = 64;
-
-    (0..count.min(MAX))
-        .filter_map(|index| state.read_u32(ptr + index * 4).ok())
-        .collect()
+fn read_type_ids(state: &HostState, ptr: u32, count: u32) -> Result<Vec<u32>> {
+    anyhow::ensure!(count <= 64, "embind type count exceeds 64: {count}");
+    let len = count.checked_mul(4).context("type array length overflow")?;
+    let bytes = state.read(ptr, len)?;
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|word| u32::from_le_bytes(word.try_into().expect("four-byte type id")))
+        .collect())
 }
 
 /// Where the interesting operands sit in a registration's argument list.
@@ -354,11 +351,11 @@ fn integer_minimum(args: &[Val]) -> Option<i64> {
 }
 
 /// Applies one registration to the registry.
-fn apply(caller: &mut Caller<'_, HostState>, layout: Layout, args: &[Val]) {
+fn apply(caller: &mut Caller<'_, HostState>, layout: Layout, args: &[Val]) -> Result<()> {
     match layout {
         Layout::Type { name_at } => {
             let (Some(id), Some(name_ptr)) = (arg(args, 0), arg(args, name_at)) else {
-                return;
+                return Ok(());
             };
             let name = caller.data().read_cstr(name_ptr).unwrap_or_default();
             if !name.is_empty() {
@@ -375,19 +372,14 @@ fn apply(caller: &mut Caller<'_, HostState>, layout: Layout, args: &[Val]) {
                 arg(args, 2),
                 integer_minimum(args),
             ) else {
-                return;
+                return Ok(());
             };
             let name = caller.data().read_cstr(name_ptr).unwrap_or_default();
             if !name.is_empty() {
                 let state = caller.data_mut();
+                let integer = IntegerType::new(bytes, minimum < 0)?;
                 state.embind.types.insert(id, name);
-                state.embind.integer_types.insert(
-                    id,
-                    IntegerType {
-                        bytes,
-                        signed: minimum < 0,
-                    },
-                );
+                state.embind.integer_types.insert(id, integer);
             }
         }
 
@@ -396,11 +388,11 @@ fn apply(caller: &mut Caller<'_, HostState>, layout: Layout, args: &[Val]) {
             let (Some(name_ptr), Some(count), Some(types_ptr)) =
                 (arg(args, 0), arg(args, 1), arg(args, 2))
             else {
-                return;
+                return Ok(());
             };
             let state = caller.data();
             let name = state.read_cstr(name_ptr).unwrap_or_default();
-            let arg_types = read_type_ids(state, types_ptr, count);
+            let arg_types = read_type_ids(state, types_ptr, count)?;
 
             caller.data_mut().embind.functions.push(EmbindFunction {
                 name,
@@ -416,7 +408,7 @@ fn apply(caller: &mut Caller<'_, HostState>, layout: Layout, args: &[Val]) {
             //  getActualTypeSignature, getActualType, upcastSignature, upcast,
             //  downcastSignature, downcast, name, destructorSignature, destructor)
             let (Some(class_type), Some(name_ptr)) = (arg(args, 0), arg(args, 10)) else {
-                return;
+                return Ok(());
             };
             let name = caller.data().read_cstr(name_ptr).unwrap_or_default();
             let base_type = arg(args, 3).unwrap_or(0);
@@ -442,11 +434,11 @@ fn apply(caller: &mut Caller<'_, HostState>, layout: Layout, args: &[Val]) {
             let (Some(class_type), Some(name_ptr), Some(count), Some(types_ptr)) =
                 (arg(args, 0), arg(args, 1), arg(args, 2), arg(args, 3))
             else {
-                return;
+                return Ok(());
             };
             let state = caller.data();
             let name = state.read_cstr(name_ptr).unwrap_or_default();
-            let arg_types = read_type_ids(state, types_ptr, count);
+            let arg_types = read_type_ids(state, types_ptr, count)?;
 
             caller.data_mut().embind.orphan_methods.push(EmbindMethod {
                 class_type,
@@ -466,7 +458,7 @@ fn apply(caller: &mut Caller<'_, HostState>, layout: Layout, args: &[Val]) {
             let (Some(class_type), Some(name_ptr), Some(field_type)) =
                 (arg(args, 0), arg(args, 1), arg(args, 2))
             else {
-                return;
+                return Ok(());
             };
             let name = caller.data().read_cstr(name_ptr).unwrap_or_default();
             // embind registers a read-only property by passing 0 for the
@@ -494,9 +486,9 @@ fn apply(caller: &mut Caller<'_, HostState>, layout: Layout, args: &[Val]) {
             let (Some(class_type), Some(count), Some(types_ptr)) =
                 (arg(args, 0), arg(args, 1), arg(args, 2))
             else {
-                return;
+                return Ok(());
             };
-            let arg_types = read_type_ids(caller.data(), types_ptr, count);
+            let arg_types = read_type_ids(caller.data(), types_ptr, count)?;
 
             caller
                 .data_mut()
@@ -514,7 +506,7 @@ fn apply(caller: &mut Caller<'_, HostState>, layout: Layout, args: &[Val]) {
             // (ownerType, name, value) — recorded so an enum's members can be
             // read back even though they are not callable.
             let (Some(owner), Some(name_ptr)) = (arg(args, 0), arg(args, 1)) else {
-                return;
+                return Ok(());
             };
             let name = caller.data().read_cstr(name_ptr).unwrap_or_default();
             let value = arg(args, 2).unwrap_or(0);
@@ -527,7 +519,9 @@ fn apply(caller: &mut Caller<'_, HostState>, layout: Layout, args: &[Val]) {
 
         Layout::Constant => {
             // (name, type, value)
-            let Some(name_ptr) = arg(args, 0) else { return };
+            let Some(name_ptr) = arg(args, 0) else {
+                return Ok(());
+            };
             let name = caller.data().read_cstr(name_ptr).unwrap_or_default();
             let value = arg(args, 2).unwrap_or(0);
             caller
@@ -537,6 +531,7 @@ fn apply(caller: &mut Caller<'_, HostState>, layout: Layout, args: &[Val]) {
                 .push((name, value as i64));
         }
     }
+    Ok(())
 }
 
 /// Defines every `_embind_register_*` import the module declares, deriving each
@@ -558,8 +553,7 @@ pub fn define(
 
         let func =
             crate::host::host_func(&mut *store, ty.clone(), move |caller, params, _results| {
-                apply(caller, layout, params);
-                Ok(())
+                apply(caller, layout, params).map_err(wasmtime::Error::from_anyhow)
             });
 
         linker
@@ -574,6 +568,14 @@ pub fn define(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn type_arrays_are_never_truncated() {
+        let state = HostState::default();
+        assert!(read_type_ids(&state, 0, 65).is_err());
+        assert!(read_type_ids(&state, u32::MAX - 1, 1).is_err());
+        assert!(read_type_ids(&state, 0, 1).is_err());
+    }
 
     #[test]
     fn legalized_bigint_bounds_preserve_signedness() {

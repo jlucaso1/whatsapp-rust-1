@@ -32,29 +32,17 @@ fn tool_with_files(id: &str, args: &[&str], files: &[(&str, Vec<u8>)]) -> Option
     }
 
     let code = runtime.run_main().expect("entry point should run");
+    let wasi = runtime.wasi();
     Some(ToolRun {
         code,
-        stdout: runtime.wasi().stdout_text(),
-        stderr: runtime.wasi().stderr_text(),
-        files: runtime.wasi().files.clone(),
+        stdout: wasi.stdout_text(),
+        stderr: wasi.stderr_text(),
+        files: wasi.files.clone(),
     })
 }
 
 fn tool(id: &str, args: &[&str], files: &[(&str, Vec<u8>)]) -> Option<(i32, String, String)> {
-    let bytes = common::capture(id).unwrap_or_else(|error| panic!("loading {id}: {error:#}"))?;
-
-    let mut runtime = Runtime::instantiate(&bytes).expect("instantiate");
-    runtime.set_args(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>());
-    for (path, contents) in files {
-        runtime.add_file(path, contents.clone());
-    }
-
-    let code = runtime.run_main().expect("entry point should run");
-    Some((
-        code,
-        runtime.wasi().stdout_text(),
-        runtime.wasi().stderr_text(),
-    ))
+    tool_with_files(id, args, files).map(|run| (run.code, run.stdout, run.stderr))
 }
 
 macro_rules! run_or_skip {

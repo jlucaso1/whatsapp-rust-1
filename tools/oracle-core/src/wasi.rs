@@ -156,12 +156,13 @@ fn fd_write(caller: &mut Caller<'_, HostState>, fd: u32, iovs: u32, count: u32, 
     }
     let written = payload.len() as u32;
 
-    let state = caller.data_mut();
+    let state = caller.data();
+    let mut wasi = state.wasi();
     match fd {
-        FD_STDOUT => state.wasi.stdout.extend_from_slice(&payload),
-        FD_STDERR => state.wasi.stderr.extend_from_slice(&payload),
+        FD_STDOUT => wasi.stdout.extend_from_slice(&payload),
+        FD_STDERR => wasi.stderr.extend_from_slice(&payload),
         _ => {
-            let Some(open) = state.wasi.open.get_mut(&fd) else {
+            let Some(open) = wasi.open.get_mut(&fd) else {
                 return EBADF;
             };
             if !open.writable {
@@ -179,7 +180,7 @@ fn fd_write(caller: &mut Caller<'_, HostState>, fd: u32, iovs: u32, count: u32, 
             let path = open.path.clone();
             open.offset = next_offset;
 
-            let file = state.wasi.files.entry(path).or_default();
+            let file = wasi.files.entry(path).or_default();
             if file.len() < end {
                 file.resize(end, 0);
             }
@@ -238,10 +239,11 @@ fn read_into(
         return EINVAL;
     };
     let state = caller.data();
-    let Some(open) = state.wasi.open.get(&fd) else {
+    let mut wasi = state.wasi();
+    let Some(open) = wasi.open.get(&fd) else {
         return EBADF;
     };
-    let Some(contents) = state.wasi.files.get(&open.path) else {
+    let Some(contents) = wasi.files.get(&open.path) else {
         return EBADF;
     };
 
@@ -270,7 +272,7 @@ fn read_into(
     // A positional read leaves the cursor where it was: that is the whole
     // difference between `pread` and `read`.
     if at.is_none()
-        && let Some(open) = caller.data_mut().wasi.open.get_mut(&fd)
+        && let Some(open) = wasi.open.get_mut(&fd)
     {
         open.offset = offset as u64;
     }
@@ -309,11 +311,11 @@ fn clock_time_get(caller: &mut Caller<'_, HostState>, id: u32, out: u32) -> i32 
 
 fn fd_seek(caller: &mut Caller<'_, HostState>, fd: u32, delta: i64, whence: u32, out: u32) -> i32 {
     let state = caller.data();
-    let Some(open) = state.wasi.open.get(&fd) else {
+    let mut wasi = state.wasi();
+    let Some(open) = wasi.open.get(&fd) else {
         return EBADF;
     };
-    let size = state
-        .wasi
+    let size = wasi
         .files
         .get(&open.path)
         .map(|file| file.len() as u64)
@@ -322,7 +324,7 @@ fn fd_seek(caller: &mut Caller<'_, HostState>, fd: u32, delta: i64, whence: u32,
         return EINVAL;
     };
 
-    if let Some(open) = caller.data_mut().wasi.open.get_mut(&fd) {
+    if let Some(open) = wasi.open.get_mut(&fd) {
         open.offset = position;
     }
     match write_u64(caller.data(), out, position) {
@@ -347,6 +349,7 @@ fn path_open(
     path_ptr: u32,
     path_len: u32,
     oflags: u32,
+    fdflags: u32,
     out: u32,
 ) -> i32 {
     // WASI preview1 oflags: bit 0 is CREAT, bit 3 is TRUNC.
@@ -354,7 +357,7 @@ fn path_open(
     const O_TRUNC: u32 = 8;
     const SUPPORTED: u32 = O_CREAT | O_TRUNC;
 
-    if oflags & !SUPPORTED != 0 {
+    if oflags & !SUPPORTED != 0 || fdflags != 0 {
         return EINVAL;
     }
 
@@ -373,24 +376,23 @@ fn path_open(
         oflags & O_TRUNC != 0
     ));
 
-    let state = caller.data_mut();
-    let exists = state.wasi.files.contains_key(&path);
+    let state = caller.data();
+    let mut wasi = state.wasi();
+    let exists = wasi.files.contains_key(&path);
     if !exists {
         if oflags & O_CREAT == 0 {
             return ENOENT;
         }
-        state.wasi.files.insert(path.clone(), Vec::new());
+        wasi.files.insert(path.clone(), Vec::new());
     } else if oflags & O_TRUNC != 0 {
-        state
-            .wasi
-            .files
+        wasi.files
             .get_mut(&path)
             .expect("existence checked")
             .clear();
     }
 
-    let fd = state.wasi.allocate_fd();
-    state.wasi.open.insert(
+    let fd = wasi.allocate_fd();
+    wasi.open.insert(
         fd,
         OpenFile {
             path,
@@ -408,9 +410,9 @@ fn path_open(
 /// `filestat` is 64 bytes; only the size field carries information here.
 fn fd_filestat_get(caller: &mut Caller<'_, HostState>, fd: u32, out: u32) -> i32 {
     let state = caller.data();
-    let size = match state.wasi.open.get(&fd) {
-        Some(open) => state
-            .wasi
+    let wasi = state.wasi();
+    let size = match wasi.open.get(&fd) {
+        Some(open) => wasi
             .files
             .get(&open.path)
             .map(|file| file.len() as u64)
@@ -437,7 +439,8 @@ fn fd_filestat_get(caller: &mut Caller<'_, HostState>, fd: u32, out: u32) -> i32
 /// `fdstat` is 24 bytes: filetype, flags, then two rights masks.
 fn fd_fdstat_get(caller: &mut Caller<'_, HostState>, fd: u32, out: u32) -> i32 {
     let state = caller.data();
-    let known = fd <= FD_ROOT || state.wasi.open.contains_key(&fd);
+    let wasi = state.wasi();
+    let known = fd <= FD_ROOT || wasi.open.contains_key(&fd);
     if !known {
         return EBADF;
     }
@@ -488,7 +491,7 @@ fn list_sizes(state: &HostState, entries: &[String], count_ptr: u32, size_ptr: u
 
 fn env_strings(state: &HostState) -> Vec<String> {
     state
-        .wasi
+        .wasi()
         .env
         .iter()
         .map(|(key, value)| format!("{key}={value}"))
@@ -599,7 +602,7 @@ fn dispatch(name: &str, caller: &mut Caller<'_, HostState>, params: &[Val]) -> i
         "fd_close" => {
             if caller
                 .data_mut()
-                .wasi
+                .wasi()
                 .open
                 .remove(&arg(params, 0))
                 .is_some()
@@ -639,6 +642,7 @@ fn dispatch(name: &str, caller: &mut Caller<'_, HostState>, params: &[Val]) -> i
             arg(params, 2),
             arg(params, 3),
             arg(params, 4),
+            arg(params, 7),
             arg(params, 8),
         ),
         "path_unlink_file" => {
@@ -646,17 +650,17 @@ fn dispatch(name: &str, caller: &mut Caller<'_, HostState>, params: &[Val]) -> i
                 return EINVAL;
             };
             let path = normalise(&String::from_utf8_lossy(&raw));
-            match caller.data_mut().wasi.files.remove(&path) {
+            match caller.data().wasi().files.remove(&path) {
                 Some(_) => ESUCCESS,
                 None => ENOENT,
             }
         }
         "args_sizes_get" => {
-            let args = caller.data().wasi.args.clone();
+            let args = caller.data().wasi().args.clone();
             list_sizes(caller.data(), &args, arg(params, 0), arg(params, 1))
         }
         "args_get" => {
-            let args = caller.data().wasi.args.clone();
+            let args = caller.data().wasi().args.clone();
             write_string_list(caller.data(), &args, arg(params, 0), arg(params, 1))
         }
         "environ_sizes_get" => {

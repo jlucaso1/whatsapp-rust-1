@@ -273,6 +273,24 @@ fn overlapping_replacements_are_rejected() {
 }
 
 #[test]
+fn replacement_cannot_extend_past_the_body() {
+    for count in [10_000, usize::MAX] {
+        assert!(
+            patch::replace(
+                &sample(),
+                &[Replace {
+                    func: 1,
+                    at: 1,
+                    count,
+                    with: vec![Edit::I32(1)],
+                }]
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
 fn value_markers_require_an_existing_i32_local() {
     let mut plan = Plan::default();
     plan.value_entry.push((1, 99));
@@ -485,4 +503,22 @@ fn a_nominated_sink_that_does_not_exist_is_refused() {
         text.contains("env::nowhere") && text.contains("env::mark"),
         "the refusal should name what was asked for and what is available: {text}"
     );
+}
+
+#[test]
+fn replacement_must_preserve_a_valid_function_end_and_stack() {
+    for (at, count, with) in [(3, 1, vec![Edit::Nop]), (1, 1, vec![Edit::Drop])] {
+        assert!(
+            patch::replace(
+                &sample(),
+                &[Replace {
+                    func: 1,
+                    at,
+                    count,
+                    with
+                }]
+            )
+            .is_err()
+        );
+    }
 }

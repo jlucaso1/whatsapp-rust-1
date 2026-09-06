@@ -101,8 +101,6 @@ pub struct HostState {
     /// The C++ exception currently unwinding. Per-thread by definition: two
     /// threads can be unwinding different exceptions at once.
     pub in_flight: crate::cxa::InFlight,
-    /// Guest-visible arguments, environment and filesystem. See `wasi.rs`.
-    pub wasi: crate::wasi::WasiState,
     /// Whether the instantiating thread registers itself as emscripten's *main
     /// runtime thread*.
     ///
@@ -193,36 +191,9 @@ impl HostState {
             imported_memory: None,
             embind: EmbindRegistry::default(),
             in_flight: crate::cxa::InFlight::default(),
-            wasi: crate::wasi::WasiState::default(),
-            // Off even for thread 0, and that is a known, measured trade-off
-            // rather than an oversight.
-            //
-            // The guest's `emscripten_main_thread_process_queued_calls` opens
-            // by asserting `emscripten_is_main_runtime_thread()` — a
-            // per-instance global set by
-            // `_emscripten_thread_init(.., is_main=1, ..)` — and traps on
-            // `unreachable` when it does not hold. With this off, *every* drain
-            // of the main-thread proxy queue therefore fails, and outgoing VoIP
-            // signaling is dispatched through exactly that queue. That is a
-            // real bug.
-            //
-            // It is *not* the reason `sendSignalingXMPP_js_sync` looked
-            // unreachable — that reading came from `all_calls_to`, which stops
-            // recording at 8192 calls while startup makes tens of millions.
-            // Measured through the counters, the engine reaches the sender with
-            // or without main-thread registration. See
-            // `examples/outbound_setup_matrix.rs`.
-            //
-            // But `thread_id == 0` here was measured and is worse: the drains
-            // stop failing and `initVoipStack` starts trapping instead (round 3
-            // of `startup_is_reliable_and_never_forces_a_turn`). In a browser
-            // the main thread returns to an event loop between calls; here it
-            // sits inside `call_embind` for the whole call, so a guest waiting
-            // on the main thread waits on something that cannot answer.
-            //
-            // The fix is neither flag value: the queue has to be drained off
-            // the blocking path. Until then this stays off, because a harness
-            // that starts reliably is worth more than one that drains.
+            // Synchronous main-thread proxy draining can deadlock startup.
+            // Keep disabled until draining can run outside the blocking guest call.
+            // Evidence: agent_docs/voip_oracle_status.md.
             register_main_thread: false,
             threads,
             memory_export: None,
@@ -501,4 +472,11 @@ pub fn sync_memory(caller: &mut Caller<'_, HostState>) {
     };
     let window = (memory.data_ptr(&caller) as usize, memory.data_size(&caller));
     caller.data_mut().linear = Some(window);
+}
+
+impl HostState {
+    /// Locks the process-wide WASI environment. Release before entering guest code.
+    pub fn wasi(&self) -> std::sync::MutexGuard<'_, crate::wasi::WasiState> {
+        self.shared.wasi.lock().expect("WASI state poisoned")
+    }
 }

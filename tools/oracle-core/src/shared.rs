@@ -103,6 +103,7 @@ pub struct SignalingCall {
 /// The cross-thread half of the host state.
 #[derive(Debug)]
 pub struct SharedHost {
+    pub(crate) wasi: Mutex<crate::wasi::WasiState>,
     trace: Mutex<Trace>,
     /// The import `patch.rs` markers call, once somebody asks to watch it.
     marker_sink: Mutex<Option<String>>,
@@ -244,6 +245,7 @@ pub const MAX_SIGHTINGS: usize = 12;
 impl Default for SharedHost {
     fn default() -> Self {
         Self {
+            wasi: Mutex::new(crate::wasi::WasiState::default()),
             trace: Mutex::new(Trace::default()),
             marker_sink: Mutex::new(None),
             snapshots: std::sync::OnceLock::new(),

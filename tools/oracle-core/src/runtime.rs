@@ -589,7 +589,7 @@ impl Runtime {
         self.store.data().embind.type_name(id)
     }
 
-    pub(crate) fn integer_type(&self, id: u32) -> Option<crate::embind::IntegerType> {
+    pub(crate) fn integer_type(&self, id: u32) -> Option<crate::integer::IntegerType> {
         self.store.data().embind.integer_type(id)
     }
 
@@ -1013,25 +1013,24 @@ impl Runtime {
     /// the first real argument there.
     pub fn set_args(&mut self, args: &[String]) {
         let state = self.store.data_mut();
-        state.wasi.args = std::iter::once("module".to_owned())
+        state.wasi().args = std::iter::once("module".to_owned())
             .chain(args.iter().cloned())
             .collect();
     }
 
     /// Sets the environment a WASI guest will see.
     pub fn set_env(&mut self, env: &[(String, String)]) {
-        self.store.data_mut().wasi.env = env.to_vec();
+        self.store.data().wasi().env = env.to_vec();
     }
 
     /// Places a file in the guest filesystem before it runs.
     pub fn add_file(&mut self, path: &str, contents: Vec<u8>) {
-        self.store.data_mut().wasi.add_file(path, contents);
+        self.store.data().wasi().add_file(path, contents);
     }
 
-    /// The in-memory filesystem and streams a WASI guest ran against.
-    #[must_use]
-    pub fn wasi(&self) -> &crate::wasi::WasiState {
-        &self.store.data().wasi
+    /// Locks the process filesystem and streams. Release before entering guest code.
+    pub fn wasi(&self) -> std::sync::MutexGuard<'_, crate::wasi::WasiState> {
+        self.store.data().wasi()
     }
 
     /// Lays out `argv` in guest memory for a `main(argc, argv)`.
@@ -1044,7 +1043,7 @@ impl Runtime {
     /// Refusing there is the honest answer: the alternative is picking an
     /// address and hoping nothing else owns it.
     fn marshal_argv(&mut self) -> Result<(i32, u32)> {
-        let mut args = self.store.data().wasi.args.clone();
+        let mut args = self.store.data().wasi().args.clone();
         if args.is_empty() {
             // `set_args` supplies this, but nothing obliges a caller to call it,
             // and a `main` whose `argv[0]` is null is a crash in most libcs.

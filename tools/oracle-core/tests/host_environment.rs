@@ -14,9 +14,7 @@ const VOIP: &str = "JgwtTQVeWPm";
 
 /// Serialises against the other test binaries, which cargo runs in parallel:
 /// two PJSIP worker pools competing for cores miss their own deadlines.
-fn engine_guard() -> common::EngineLock {
-    common::engine_lock()
-}
+use common::threaded_guard as engine_guard;
 
 fn voip() -> Option<Runtime> {
     let bytes =
@@ -328,6 +326,10 @@ mod wasi_fixture {
     }
 
     pub fn module() -> Vec<u8> {
+        module_with_fdflags(0)
+    }
+
+    pub fn module_with_fdflags(fdflags: i32) -> Vec<u8> {
         let mut types = TypeSection::new();
         // 0: fd_pread(fd, iovs, iovs_len, offset: u64, nread)
         types.ty().function([I32, I32, I32, I64, I32], [I32]);
@@ -418,7 +420,7 @@ mod wasi_fixture {
             .local_get(2)
             .i64_const(0)
             .i64_const(0)
-            .i32_const(0)
+            .i32_const(fdflags)
             .i32_const(OPENED_FD as i32)
             .call(2)
             .end();
@@ -1167,4 +1169,47 @@ fn wasi_random_rejection_preserves_memory_and_rng() {
         assert_eq!(errno_of(&result), 0);
     }
     assert_eq!(tested.read(0, 32).unwrap(), baseline.read(0, 32).unwrap());
+}
+
+#[test]
+fn unsupported_fdflags_do_not_modify_files() {
+    for flags in [1, 2, 4, 8, 16, 32] {
+        let mut runtime = Runtime::instantiate(&wasi_fixture::module_with_fdflags(flags)).unwrap();
+        runtime.add_file("data.bin", vec![1, 2, 3]);
+        runtime
+            .write_bytes_at(wasi_fixture::PATH, b"data.bin")
+            .unwrap();
+        let result = runtime
+            .call(
+                "do_open",
+                &[
+                    wasmtime::Val::I32(wasi_fixture::PATH as i32),
+                    wasmtime::Val::I32(8),
+                    wasmtime::Val::I32(8),
+                ],
+            )
+            .unwrap();
+        assert_eq!(errno_of(&result), 28, "flags {flags}");
+        assert_eq!(runtime.wasi().file("data.bin"), Some([1, 2, 3].as_slice()));
+    }
+}
+
+#[test]
+fn workers_share_the_process_environment() {
+    let main = oracle_core::HostState::default();
+    main.wasi().args.push("module".into());
+    main.wasi().env.push(("MODE".into(), "test".into()));
+    main.wasi().add_file("input", vec![1, 2]);
+    let worker = oracle_core::HostState::for_thread(
+        main.shared.clone(),
+        1,
+        oracle_core::ThreadPolicy::Spawn,
+    );
+    assert_eq!(worker.wasi().args, ["module"]);
+    assert_eq!(worker.wasi().env, [("MODE".into(), "test".into())]);
+    assert_eq!(worker.wasi().file("input"), Some([1, 2].as_slice()));
+    worker.wasi().stdout.extend_from_slice(b"worker");
+    worker.wasi().add_file("output", vec![3]);
+    assert_eq!(main.wasi().stdout, b"worker");
+    assert_eq!(main.wasi().file("output"), Some([3].as_slice()));
 }

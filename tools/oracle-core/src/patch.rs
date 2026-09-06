@@ -771,8 +771,17 @@ pub fn replace(bytes: &[u8], edits: &[Replace]) -> Result<Vec<u8>> {
                 edit.at
             )
         })?;
+        let after = edit
+            .at
+            .checked_add(edit.count)
+            .context("replacement count overflow")?;
+        ensure!(
+            after <= offsets.len(),
+            "replacement exceeds function {} body",
+            edit.func
+        );
         let end = offsets
-            .get(edit.at + edit.count)
+            .get(after)
             .copied()
             .unwrap_or(layout.bodies[ordinal].end);
 
@@ -795,7 +804,11 @@ pub fn replace(bytes: &[u8], edits: &[Replace]) -> Result<Vec<u8>> {
         );
     }
 
-    rewrite(bytes, &layout, Vec::new(), &cuts)
+    let rewritten = rewrite(bytes, &layout, Vec::new(), &cuts)?;
+    wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+        .validate_all(&rewritten)
+        .context("replacement produces invalid wasm")?;
+    Ok(rewritten)
 }
 
 /// Rebuilds the module with the code section re-emitted.

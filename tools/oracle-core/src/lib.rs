@@ -18,6 +18,7 @@ pub mod emval;
 pub mod exports;
 pub mod host;
 pub mod inspect;
+mod integer;
 pub mod media_probe;
 pub mod migrate;
 pub mod patch;
