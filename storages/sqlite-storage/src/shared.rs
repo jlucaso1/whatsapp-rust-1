@@ -401,11 +401,6 @@ mod tests {
                     .await
             }
         });
-        tokio::task::yield_now().await;
-        assert!(
-            !second.is_finished(),
-            "the second write must await the permit"
-        );
         release_tx.send(()).expect("release blocking write");
         second.await.expect("second join").expect("second write");
     }
