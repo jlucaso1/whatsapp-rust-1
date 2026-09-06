@@ -8,8 +8,11 @@ use diesel::sqlite::SqliteConnection;
 use diesel::upsert::excluded;
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use log::warn;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+use thiserror::Error;
 use wacore::appstate::hash::HashState;
 use wacore::appstate::processor::AppStateMutationMAC;
 use wacore::libsignal::protocol::{KeyPair, PrivateKey, PublicKey};
@@ -270,6 +273,7 @@ pub struct SqliteStore {
     /// `SQLITE_LOCKED_SHAREDCACHE`, which `busy_timeout` cannot absorb.
     pub(crate) snapshot_safe: bool,
     pub(crate) database_path: String,
+    pub(crate) commit_barrier: Option<CommitBarrierHook>,
     device_id: i32,
 }
 
@@ -308,6 +312,29 @@ pub type ConnectionInitHook = Arc<
         + Send
         + Sync,
 >;
+
+#[cfg(target_family = "wasm")]
+pub type CommitBarrierFuture = Pin<Box<dyn Future<Output = Result<()>> + 'static>>;
+
+#[cfg(not(target_family = "wasm"))]
+pub type CommitBarrierFuture = Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>;
+
+#[cfg(target_family = "wasm")]
+pub type CommitBarrierHook = Arc<dyn Fn() -> CommitBarrierFuture + Send + Sync + 'static>;
+
+/// A write reached SQLite's commit boundary, but its backing durability hook
+/// failed afterwards. Callers must treat the SQL mutation as committed in the
+/// live connection while retaining any retry state needed by the backend.
+#[derive(Debug, Error)]
+#[error("post-commit durability barrier failed")]
+pub struct CommitBarrierError(#[source] pub StoreError);
+
+pub(crate) fn commit_barrier_error(error: StoreError) -> StoreError {
+    StoreError::Database(Box::new(CommitBarrierError(error)))
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub type CommitBarrierHook = Arc<dyn Fn() -> CommitBarrierFuture + Send + Sync + 'static>;
 
 /// Per-store connection tuning. [`Default`] is a low-memory profile sized for one
 /// `SqliteStore` per WhatsApp session on a single process: a single pooled connection
@@ -402,6 +429,11 @@ pub struct SqliteStoreConfig {
     /// pragmas, WAL setup, and migrations. See [`ConnectionInitHook`] for the contract;
     /// set via [`SqliteStoreConfig::with_connection_init`].
     pub connection_init: Option<ConnectionInitHook>,
+    /// Optional awaitable called after each successful SQLite write commit.
+    /// Readers never call it. The callback runs while the write permit is held
+    /// and must not re-enter this store or a [`SharedSqlite`](crate::SharedSqlite)
+    /// handle, which would wait for the permit it already owns.
+    pub commit_barrier: Option<CommitBarrierHook>,
 }
 
 impl Default for SqliteStoreConfig {
@@ -420,6 +452,7 @@ impl Default for SqliteStoreConfig {
             synchronous: Synchronous::Normal,
             thread_pool: None,
             connection_init: None,
+            commit_barrier: None,
         }
     }
 }
@@ -472,6 +505,13 @@ impl SqliteStoreConfig {
             + 'static,
     {
         self.connection_init = Some(Arc::new(hook));
+        self
+    }
+
+    /// Install an awaitable that confirms a write reached the configured
+    /// backend before the write operation returns.
+    pub fn with_commit_barrier(mut self, barrier: CommitBarrierHook) -> Self {
+        self.commit_barrier = Some(barrier);
         self
     }
 }
@@ -715,6 +755,7 @@ impl SqliteStore {
         // Left as the `Option` the embedder gave; `pool::builder` resolves it.
         let thread_pool = config.thread_pool;
         let read_thread_pool = thread_pool.clone();
+        let commit_barrier = config.commit_barrier.clone();
 
         let options = ConnectionOptions {
             cache_size_kib: config.cache_size_kib,
@@ -780,6 +821,9 @@ impl SqliteStore {
         )
         .await
         .map_err(|e| StoreError::Database(Box::new(e)))??;
+        if let Some(barrier) = commit_barrier {
+            barrier().await.map_err(commit_barrier_error)?;
+        }
 
         // Reader connections only pay off under WAL, and only with a page cache
         // per connection. Each of the two ways that can fail turns the intended
@@ -840,6 +884,7 @@ impl SqliteStore {
             reads,
             snapshot_safe: declined.is_none(),
             database_path,
+            commit_barrier: config.commit_barrier,
             device_id,
         })
     }
@@ -914,6 +959,7 @@ impl SqliteStore {
             reads: self.reads.clone(),
             snapshot_safe: self.snapshot_safe,
             database_path: self.database_path.clone(),
+            commit_barrier: self.commit_barrier.clone(),
             device_id,
         }
     }
@@ -1012,10 +1058,42 @@ impl SqliteStore {
         Ok(result)
     }
 
+    async fn await_commit_barrier(&self) -> Result<()> {
+        if let Some(barrier) = &self.commit_barrier {
+            barrier().await.map_err(commit_barrier_error)?;
+        }
+        Ok(())
+    }
+
     /// Execute a database operation with semaphore serialization and retry on
     /// transient SQLite lock/busy errors. Mirrors WhatsApp Web's PromiseQueue
     /// pattern that serializes database commits to avoid concurrent write contention.
     async fn with_retry<F, T>(&self, op_name: &str, make_op: F) -> Result<T>
+    where
+        F: Fn() -> Box<
+            dyn FnOnce(&mut SqliteConnection) -> std::result::Result<T, DieselError> + Send,
+        >,
+        T: Send + 'static,
+    {
+        self.with_retry_inner(op_name, make_op, true).await
+    }
+
+    async fn with_read_retry<F, T>(&self, op_name: &str, make_op: F) -> Result<T>
+    where
+        F: Fn() -> Box<
+            dyn FnOnce(&mut SqliteConnection) -> std::result::Result<T, DieselError> + Send,
+        >,
+        T: Send + 'static,
+    {
+        self.with_retry_inner(op_name, make_op, false).await
+    }
+
+    async fn with_retry_inner<F, T>(
+        &self,
+        op_name: &str,
+        make_op: F,
+        await_barrier: bool,
+    ) -> Result<T>
     where
         F: Fn() -> Box<
             dyn FnOnce(&mut SqliteConnection) -> std::result::Result<T, DieselError> + Send,
@@ -1035,21 +1113,32 @@ impl SqliteStore {
             let pool = self.pool.clone();
             let op = make_op();
 
-            let result =
-                crate::pool::spawn_blocking(move || -> std::result::Result<T, DieselOrStore> {
-                    let _permit = permit;
+            let result = crate::pool::spawn_blocking(move || {
+                let result = (|| {
                     let mut conn = pool
                         .get()
                         .map_err(|e| DieselOrStore::Store(StoreError::Connection(Box::new(e))))?;
                     op(&mut conn).map_err(DieselOrStore::Diesel)
-                })
-                .await;
+                })();
+                (result, permit)
+            })
+            .await;
 
             match result {
-                Ok(Ok(val)) => return Ok(val),
-                Ok(Err(DieselOrStore::Diesel(ref e)))
+                Ok((Ok(val), permit)) => {
+                    let barrier = if await_barrier {
+                        self.await_commit_barrier().await
+                    } else {
+                        Ok(())
+                    };
+                    drop(permit);
+                    barrier?;
+                    return Ok(val);
+                }
+                Ok((Err(DieselOrStore::Diesel(ref e)), permit))
                     if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
                 {
+                    drop(permit);
                     let delay_ms = 10u64 * (1u64 << attempt.min(4));
                     // Skip the first transient blip; warn from the second retry on so
                     // sustained busy/locked contention doesn't go unobserved.
@@ -1062,7 +1151,10 @@ impl SqliteStore {
                     }
                     retry_backoff(delay_ms).await;
                 }
-                Ok(Err(e)) => return Err(e.into()),
+                Ok((Err(e), permit)) => {
+                    drop(permit);
+                    return Err(e.into());
+                }
                 Err(e) => return Err(StoreError::Database(Box::new(e))),
             }
         }
@@ -1491,7 +1583,10 @@ impl SqliteStore {
             drop(permit);
 
             match result {
-                Ok(Ok(())) => return Ok(()),
+                Ok(Ok(())) => {
+                    self.await_commit_barrier().await?;
+                    return Ok(());
+                }
                 Ok(Err(DieselOrStore::Diesel(ref e)))
                     if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
                 {
@@ -1534,6 +1629,7 @@ impl SqliteStore {
         .await
         .map_err(|e| StoreError::Database(Box::new(e)))??;
 
+        self.await_commit_barrier().await?;
         Ok(())
     }
 
@@ -1622,7 +1718,10 @@ impl SqliteStore {
             drop(permit);
 
             match result {
-                Ok(Ok(())) => return Ok(()),
+                Ok(Ok(())) => {
+                    self.await_commit_barrier().await?;
+                    return Ok(());
+                }
                 Ok(Err(DieselOrStore::Diesel(ref e)))
                     if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
                 {
@@ -1665,6 +1764,7 @@ impl SqliteStore {
         .await
         .map_err(|e| StoreError::Database(Box::new(e)))??;
 
+        self.await_commit_barrier().await?;
         Ok(())
     }
 
@@ -1692,6 +1792,7 @@ impl SqliteStore {
         })
         .await
         .map_err(|e| StoreError::Database(Box::new(e)))??;
+        self.await_commit_barrier().await?;
         Ok(())
     }
 
@@ -1732,6 +1833,7 @@ impl SqliteStore {
         })
         .await
         .map_err(|e| StoreError::Database(Box::new(e)))??;
+        self.await_commit_barrier().await?;
         Ok(())
     }
 
@@ -1809,6 +1911,7 @@ impl SqliteStore {
         })
         .await
         .map_err(|e| StoreError::Database(Box::new(e)))??;
+        self.await_commit_barrier().await?;
         Ok(())
     }
 
@@ -2377,7 +2480,10 @@ impl SignalStore for SqliteStore {
             drop(permit);
 
             match result {
-                Ok(Ok(())) => return Ok(()),
+                Ok(Ok(())) => {
+                    self.await_commit_barrier().await?;
+                    return Ok(());
+                }
                 Ok(Err(DieselOrStore::Diesel(ref e)))
                     if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
                 {
@@ -2507,7 +2613,10 @@ impl SignalStore for SqliteStore {
             drop(permit);
 
             match result {
-                Ok(Ok(())) => return Ok(()),
+                Ok(Ok(())) => {
+                    self.await_commit_barrier().await?;
+                    return Ok(());
+                }
                 Ok(Err(DieselOrStore::Diesel(ref e)))
                     if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
                 {
@@ -2634,7 +2743,10 @@ impl SignalStore for SqliteStore {
             drop(permit);
 
             match result {
-                Ok(Ok(())) => return Ok(()),
+                Ok(Ok(())) => {
+                    self.await_commit_barrier().await?;
+                    return Ok(());
+                }
                 Ok(Err(DieselOrStore::Diesel(ref e)))
                     if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
                 {
@@ -2717,7 +2829,10 @@ impl SignalStore for SqliteStore {
             drop(permit);
 
             match result {
-                Ok(Ok(())) => return Ok(()),
+                Ok(Ok(())) => {
+                    self.await_commit_barrier().await?;
+                    return Ok(());
+                }
                 Ok(Err(DieselOrStore::Diesel(ref e)))
                     if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
                 {
@@ -3985,7 +4100,7 @@ impl ProtocolStore for SqliteStore {
         let device_id = self.device_id;
         // Retry on SQLITE_BUSY: a transient lock here must not surface as a read
         // failure, which fails closed and forces an unnecessary redelivery.
-        self.with_retry("get_pending_inbound", || {
+        self.with_read_retry("get_pending_inbound", || {
             let chat = chat.clone();
             let sender = sender.clone();
             let id = id.clone();
@@ -4339,6 +4454,7 @@ impl DeviceStore for SqliteStore {
         .await
         .map_err(|e| StoreError::Database(Box::new(e)))??;
 
+        self.await_commit_barrier().await?;
         Ok(())
     }
 
@@ -4824,6 +4940,7 @@ mod tests {
                     .build(),
             )),
             connection_init: None,
+            commit_barrier: None,
         };
         let store = SqliteStore::with_config(&db_name, config)
             .await
