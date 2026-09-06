@@ -1,40 +1,8 @@
-//! Host-driven scheduling of guest threads.
+//! Cooperative scheduling of guest threads.
 //!
-//! Guest threads are real OS threads over one shared memory, so the OS decides
-//! when each runs. That is what makes the VoIP engine's startup trap about one
-//! time in nine: two threads reach the same state before either finishes with
-//! it.
-//!
-//! This makes the host decide instead. At most one guest thread executes at a
-//! time, and a thread gives up its turn at a host call — the one place the host
-//! is guaranteed to see. Guest code between two host calls runs to completion,
-//! so nothing can interleave inside it.
-//!
-//! # Measured, not assumed
-//!
-//! The engine's watchdog logs `check_locking_order wrong order for mutex` on
-//! runs that stall, which made this the obvious suspect: serialising guest
-//! threads is exactly the thing that could reorder how they take its locks. It
-//! was measured rather than reasoned about, by counting how often an outgoing
-//! call reaches the `Calling` state — **5 runs in 6 with scheduling on, 0 in 6
-//! with it off**. It is load-bearing, and the lock-order complaints are a
-//! symptom of something else.
-//!
-//! # What this does and does not buy
-//!
-//! It removes *data* races: two threads can no longer be inside guest code at
-//! once. It does **not** make a run reproducible on its own — which thread wins
-//! the next turn still depends on the OS. Reproducible scheduling would need a
-//! fixed policy for choosing the next runner, which is a further step this
-//! leaves open.
-//!
-//! # Deadlock
-//!
-//! A thread that waits on another *without* making a host call would hold its
-//! turn forever. Acquiring is therefore bounded: past the deadline a thread
-//! takes its turn regardless, trading the guarantee for liveness, and says so
-//! in the log. That is the honest failure mode — the alternative is a harness
-//! that hangs.
+//! Turns encourage progress at host calls but may time out. Workers can execute
+//! concurrently, so scheduling is not a mutual exclusion or memory-safety contract.
+//! Shutdown disables scheduling and wakes blocked acquisitions before joining workers.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -53,7 +21,7 @@ const TURN_TIMEOUT: Duration = Duration::from_secs(5);
 /// write and cheap enough to reach the write in the first place.
 const STRICT_TIMEOUT: Duration = Duration::from_millis(25);
 
-/// Serialises guest execution across threads.
+/// Coordinates cooperative turns across guest threads.
 #[derive(Debug, Default)]
 pub struct Scheduler {
     state: Mutex<State>,
@@ -83,7 +51,14 @@ impl Scheduler {
         self.enabled.store(true, Ordering::SeqCst);
     }
 
-    /// Demands one guest thread at a time. See `Runtime::demand_strict_turns`.
+    pub(crate) fn shutdown(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        self.enabled.store(false, Ordering::SeqCst);
+        state.holder = None;
+        self.turn_available.notify_all();
+    }
+
+    /// Requests turns at each guest entry. See `Runtime::demand_strict_turns`.
     pub fn demand_strict(&self) {
         self.strict.store(true, Ordering::SeqCst);
     }
@@ -139,7 +114,9 @@ impl Scheduler {
                 .unwrap_or_else(|e| e.into_inner());
             state = next;
         }
-        state.holder = Some(thread);
+        if self.is_enabled() {
+            state.holder = Some(thread);
+        }
 
         self.waiting.fetch_sub(1, Ordering::SeqCst);
     }
@@ -208,6 +185,52 @@ mod tests {
     /// holding the turn stays the recorded holder, and every later acquisition
     /// then waits out `TURN_TIMEOUT` and forces its way through — one failed
     /// initialisation turning serialisation off for the rest of the run.
+    #[test]
+    fn runtime_drop_waits_for_a_worker_blocked_in_the_host() {
+        use wasm_encoder::{EntityType, ImportSection, MemoryType, Module};
+        let mut imports = ImportSection::new();
+        imports.import(
+            "env",
+            "memory",
+            EntityType::Memory(MemoryType {
+                minimum: 1,
+                maximum: Some(1),
+                memory64: false,
+                shared: true,
+                page_size_log2: None,
+            }),
+        );
+        let mut module = Module::new();
+        module.section(&imports);
+        let mut runtime = crate::Runtime::instantiate(&module.finish()).unwrap();
+        runtime.set_thread_policy(crate::ThreadPolicy::Spawn);
+        runtime
+            .write_bytes_at(128 + 52, &4096_u32.to_le_bytes())
+            .unwrap();
+        runtime
+            .write_bytes_at(128 + 56, &1024_u32.to_le_bytes())
+            .unwrap();
+        let shared = std::sync::Arc::clone(runtime.shared());
+        shared.scheduler.acquire(0);
+        assert_eq!(
+            runtime.state().spawner.as_ref().unwrap().spawn(128, 0, 0),
+            0
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while shared.scheduler.waiting.load(Ordering::SeqCst) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "worker never reached scheduler acquisition"
+            );
+            std::thread::yield_now();
+        }
+        drop(runtime);
+        let remaining = shared.live_threads();
+        shared.scheduler.release(0);
+        assert!(shared.wait_until_idle(Duration::from_secs(5)));
+        assert_eq!(remaining, 0, "drop returned with a detached worker");
+    }
+
     #[test]
     fn a_turn_is_given_back_when_its_holder_returns_early() {
         let scheduler = Scheduler::default();

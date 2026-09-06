@@ -79,7 +79,9 @@ retains its 24-survivor budget. C tests explicitly use their historical tuning w
 `cargo xt mlow pack` encodes JSON values as CBOR and zstd. It preserves integers, float types and every numeric
 value; an f32 representation is used only when exact. The check compares decompressed CBOR bytes,
 so a different zstd version cannot masquerade as changed oracle data. `wasm-fixtures.json` records
-artifact hashes/sizes. Rust uses test-only `ciborium` and pure-Rust `ruzstd`; runtime dependencies
+artifact hashes/sizes. Check mode derives the compressed hash and size from the
+committed archive; equivalent recompression still requires matching manifest
+metadata. Rust uses test-only `ciborium` and pure-Rust `ruzstd`; runtime dependencies
 and the runtime `.bin` tables are unaffected.
 
 The large legacy JSON and two postfilter RAW files were replaced by compact archives. Their

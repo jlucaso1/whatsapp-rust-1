@@ -103,6 +103,7 @@ pub struct SignalingCall {
 /// The cross-thread half of the host state.
 #[derive(Debug)]
 pub struct SharedHost {
+    pub(crate) workers: crate::threads::Workers,
     pub(crate) wasi: Mutex<crate::wasi::WasiState>,
     trace: Mutex<Trace>,
     /// The import `patch.rs` markers call, once somebody asks to watch it.
@@ -245,6 +246,7 @@ pub const MAX_SIGHTINGS: usize = 12;
 impl Default for SharedHost {
     fn default() -> Self {
         Self {
+            workers: crate::threads::Workers::default(),
             wasi: Mutex::new(crate::wasi::WasiState::default()),
             trace: Mutex::new(Trace::default()),
             marker_sink: Mutex::new(None),
@@ -595,6 +597,7 @@ impl SharedHost {
     /// competes with every engine that ran before it.
     pub fn request_shutdown(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
+        self.scheduler.shutdown();
     }
 
     /// Whether the owning `Runtime` has gone away and workers should stop.

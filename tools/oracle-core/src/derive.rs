@@ -623,6 +623,20 @@ impl<'a> Executor<'a> {
         spec: &Spec,
         resolutions: &BTreeMap<String, Resolved>,
     ) -> Result<()> {
+        for step in &spec.steps {
+            match step {
+                Step::Read { out, .. } | Step::DumpData { out, .. } => {
+                    self.output_path(out)?;
+                }
+                Step::CaptureMemory { out, .. } | Step::CaptureValue { out, .. } => {
+                    self.output_path(Path::new(out))?;
+                }
+                Step::AssertSha256 { file, .. } => {
+                    self.output_path(file)?;
+                }
+                _ => {}
+            }
+        }
         std::fs::create_dir_all(self.out_dir)
             .with_context(|| format!("creating {}", self.out_dir.display()))?;
         let mut plan = crate::patch::Plan::default();
@@ -791,6 +805,16 @@ impl<'a> Executor<'a> {
                     .all(|component| matches!(component, std::path::Component::Normal(_))),
             "derivation output must be a normal relative path: {}",
             file.display()
+        );
+        anyhow::ensure!(
+            !file
+                .components()
+                .next()
+                .and_then(|component| component.as_os_str().to_str())
+                .is_some_and(|name| name
+                    .trim_end_matches(['.', ' '])
+                    .eq_ignore_ascii_case("manifest.json")),
+            "manifest.json is reserved for derivation metadata"
         );
         Ok(self.out_dir.join(file))
     }
@@ -1191,6 +1215,31 @@ fn dump_data(bytes: &[u8], segment: usize, offset: usize, len: usize) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manifest_paths_are_rejected_before_writing_outputs() {
+        for path in ["manifest.json", "manifest.json/child", "MANIFEST.JSON"] {
+            let directory = tempfile::tempdir().unwrap();
+            let spec: Spec = serde_json::from_value(serde_json::json!({
+                "module": {"id":"probe", "sha256":"", "size":0},
+                "steps": [
+                    {"op":"dump_data", "segment":0,"offset":0,"len":1,"out":"first.bin"},
+                    {"op":"dump_data", "segment":0,"offset":0,"len":1,"out":path}
+                ]
+            }))
+            .unwrap();
+            let mut executor = Executor::new(directory.path());
+            assert!(
+                executor
+                    .execute(&probe_module(), &spec, &BTreeMap::new())
+                    .is_err()
+            );
+            assert!(
+                !directory.path().join("first.bin").exists(),
+                "validation ran after writing outputs"
+            );
+        }
+    }
 
     #[test]
     fn selected_leaf_preserves_float_memory_effects_and_traps() {

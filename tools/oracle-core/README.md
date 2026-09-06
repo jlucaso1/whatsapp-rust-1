@@ -275,7 +275,8 @@ embind signature:
 over the same shared memory. Each worker installs the stack allocated by the
 guest, initializes pthread/TLS state, and reports initialization failures.
 The main thread uses `can_block = 0` so waits can yield to host code.
-`Runtime::drop` stops and joins the workers.
+`Runtime::drop` closes worker registration, wakes scheduler waiters and joins
+every worker, including those still in host code.
 
 Main-runtime registration remains disabled by default: synchronous proxy
 queue draining can block startup. Experiments may opt in explicitly through
@@ -547,3 +548,7 @@ shared by workers. `Runtime::wasi()` returns a lock guard: release it before
 calling guest code. Unsupported `path_open` descriptor flags (including append)
 return `EINVAL` before any file mutation. `oracle run --log` reports unsupported
 logging explicitly.
+
+Derivation output paths reserve `manifest.json` and are validated before any
+step runs. Enum-table reads are limited to 65,536 entries and reject address
+overflow. WASI validates `nwritten` before changing streams, files or offsets.

@@ -254,8 +254,8 @@ impl Origin {
     }
 }
 
-/// The constant offset an active element segment starts at.
-fn const_offset(expr: &wasmparser::ConstExpr<'_>) -> Option<u32> {
+/// An offset encoded as exactly one `i32.const` followed by `end`.
+pub fn const_offset(expr: &wasmparser::ConstExpr<'_>) -> Option<u32> {
     let mut reader = expr.get_operators_reader();
     let Operator::I32Const { value } = reader.read().ok()? else {
         return None;
@@ -434,7 +434,10 @@ impl Layout {
                         };
                         if let wasmparser::ElementItems::Functions(items) = element.items {
                             for (slot, func) in items.into_iter().enumerate() {
-                                table.insert(base + slot as u32, func.context("element")?);
+                                let address = base
+                                    .checked_add(u32::try_from(slot)?)
+                                    .context("table slot overflow")?;
+                                table.insert(address, func.context("element")?);
                             }
                         }
                     }
@@ -1350,6 +1353,16 @@ pub fn find_callers(bytes: &[u8], callee: u32) -> Result<Vec<u32>> {
 /// Entries that do not address readable text come back as `None`, which is what
 /// bounds the guess: a run of them means the table ended.
 pub fn read_string_table(bytes: &[u8], base: u32, count: u32) -> Result<Vec<Option<String>>> {
+    const MAX_ENTRIES: u32 = 65_536;
+    anyhow::ensure!(
+        count <= MAX_ENTRIES,
+        "enum table exceeds {MAX_ENTRIES} entries"
+    );
+    let len = count.checked_mul(4).context("enum table length overflow")?;
+    if len != 0 {
+        base.checked_add(len - 1)
+            .context("enum table address overflow")?;
+    }
     let module = Layout::read(bytes)?;
 
     let word_at = |addr: u32| -> Option<u32> {
@@ -1411,6 +1424,15 @@ pub fn find_constant_users(bytes: &[u8], value: i32) -> Result<Vec<(u32, usize)>
 #[cfg(test)]
 mod offset_tests {
     use super::*;
+
+    #[test]
+    fn enum_table_ranges_are_checked_before_reading() {
+        let module = b"\0asm\x01\0\0\0";
+        assert!(read_string_table(module, u32::MAX - 1, 1).is_err());
+        assert!(read_string_table(module, 0, 65_537).is_err());
+        assert_eq!(read_string_table(module, 0, 2).unwrap(), vec![None, None]);
+        assert!(read_string_table(module, u32::MAX, 0).unwrap().is_empty());
+    }
 
     #[test]
     fn compound_offsets_are_not_mistaken_for_the_first_operand() {

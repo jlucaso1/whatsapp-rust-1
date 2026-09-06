@@ -11,7 +11,7 @@
 //! every instance because they were all initialised identically. Passing a table
 //! index between threads is therefore sound; passing a `Func` would not be.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -27,6 +27,51 @@ use crate::state::{HostState, ThreadPolicy};
 /// A worker whose loop never terminates is normal — it is waiting for work that
 /// will not arrive here — so this bounds it rather than hanging the process.
 const THREAD_FUEL: u64 = 2_000_000_000;
+
+#[derive(Debug, Default)]
+pub(crate) struct Workers(Mutex<WorkerState>);
+
+#[derive(Debug, Default)]
+struct WorkerState {
+    stopping: bool,
+    handles: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Workers {
+    fn launch(&self, name: String, run: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
+        // Serialize registration with shutdown so no child can escape the join set.
+        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        if state.stopping {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "runtime is stopping",
+            ));
+        }
+        state
+            .handles
+            .push(std::thread::Builder::new().name(name).spawn(run)?);
+        Ok(())
+    }
+
+    pub(crate) fn stop_and_join(&self) -> usize {
+        let handles = {
+            let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+            state.stopping = true;
+            std::mem::take(&mut state.handles)
+        };
+        handles
+            .into_iter()
+            .map(|handle| usize::from(handle.join().is_err()))
+            .sum()
+    }
+}
+
+struct ThreadFinished(Arc<SharedHost>);
+impl Drop for ThreadFinished {
+    fn drop(&mut self) {
+        self.0.thread_finished();
+    }
+}
 
 /// Everything needed to bring up another instance of the running module.
 pub struct Spawner {
@@ -98,9 +143,11 @@ impl Spawner {
         let id = shared.allocate_thread_id();
 
         shared.thread_started();
-        let launched = std::thread::Builder::new()
-            .name(format!("wasm-thread-{id}"))
-            .spawn(move || {
+        let launched = self
+            .shared
+            .workers
+            .launch(format!("wasm-thread-{id}"), move || {
+                let _finished = ThreadFinished(Arc::clone(&shared));
                 let outcome = run_thread(
                     Context_ {
                         engine,
@@ -126,11 +173,10 @@ impl Spawner {
                     };
                     shared.log(id, format!("thread {id} ended: {why}"));
                 }
-                shared.thread_finished();
             });
 
         match launched {
-            Ok(_handle) => 0,
+            Ok(()) => 0,
             Err(error) => {
                 self.shared
                     .log(0, format!("pthread_create: host refused: {error}"));
@@ -207,6 +253,7 @@ fn run_thread(ctx: Context_, thread_ptr: u32, start_routine: u32, arg: u32) -> R
     // this costs nothing during a run and makes shutdown independent of the
     // worker reaching a host call.
     store.set_epoch_deadline(1);
+    anyhow::ensure!(!ctx.shared.is_shutting_down(), "runtime is stopping");
     // Worker threads are where the interesting host calls happen, so a watch
     // installed only on the main store would miss most of them.
     crate::host::install_memory_watch(&mut store);
@@ -255,6 +302,7 @@ fn run_thread(ctx: Context_, thread_ptr: u32, start_routine: u32, arg: u32) -> R
     // out `TURN_TIMEOUT` and forces its way through, which turns one failed
     // initialisation into an unserialised run. See `Scheduler::turn`.
     let turn = ctx.shared.scheduler.turn(ctx.id);
+    anyhow::ensure!(!ctx.shared.is_shutting_down(), "runtime is stopping");
     // Both spellings, for the same reason the main thread needs both: a module
     // that exports `_emscripten_thread_init` and is asked for
     // `__emscripten_thread_init` silently falls through to the TLS-only path,
@@ -363,6 +411,7 @@ fn run_thread(ctx: Context_, thread_ptr: u32, start_routine: u32, arg: u32) -> R
 
     // Same rule as the main thread: hold a turn while inside guest code.
     let turn = ctx.shared.scheduler.turn(ctx.id);
+    anyhow::ensure!(!ctx.shared.is_shutting_down(), "runtime is stopping");
     let outcome = entry
         .call(&mut store, &[Val::I32(arg as i32)], &mut out)
         .context("thread entry point");
@@ -448,3 +497,50 @@ fn first_line(error: &impl std::fmt::Display) -> String {
 
 /// Default budget for `Runtime::quiesce`.
 pub const DEFAULT_QUIESCE: Duration = Duration::from_secs(5);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn shutdown_closes_registration_and_waits_for_all_handles() {
+        let workers = Arc::new(Workers::default());
+        let (release, blocked) = std::sync::mpsc::channel();
+        workers
+            .launch("blocked".into(), move || {
+                blocked.recv().unwrap();
+            })
+            .unwrap();
+        let joining = Arc::clone(&workers);
+        let (done, completed) = std::sync::mpsc::channel();
+        let joiner = std::thread::spawn(move || {
+            done.send(joining.stop_and_join()).unwrap();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !workers.0.lock().unwrap().stopping {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(workers.launch("late".into(), || {}).is_err());
+        assert!(completed.try_recv().is_err());
+        release.send(()).unwrap();
+        assert_eq!(completed.recv_timeout(Duration::from_secs(3)).unwrap(), 0);
+        joiner.join().unwrap();
+        assert_eq!(workers.stop_and_join(), 0);
+    }
+
+    #[test]
+    fn a_panicking_worker_still_releases_its_live_count() {
+        let shared = Arc::new(SharedHost::default());
+        shared.thread_started();
+        let worker = Arc::clone(&shared);
+        shared
+            .workers
+            .launch("panicking".into(), move || {
+                let _finished = ThreadFinished(worker);
+                panic!("worker failed");
+            })
+            .unwrap();
+        assert_eq!(shared.workers.stop_and_join(), 1);
+        assert_eq!(shared.live_threads(), 0);
+    }
+}

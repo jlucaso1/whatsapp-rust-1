@@ -14,9 +14,9 @@
 //! cargo run --release --example table_slot_of -- S_ivh1PriOA 855 --window 4
 //! ```
 use anyhow::{Context, Result, bail};
-use oracle_core::Catalog;
+use oracle_core::{Catalog, abi::const_offset};
 use std::collections::BTreeMap;
-use wasmparser::{ElementItems, ElementKind, Operator, Parser, Payload};
+use wasmparser::{ElementItems, ElementKind, Parser, Payload};
 
 /// Every active table slot, as `slot -> function index`.
 ///
@@ -46,21 +46,15 @@ fn table(bytes: &[u8]) -> Result<(BTreeMap<u32, u32>, usize)> {
                 continue;
             };
             for (i, func) in items.into_iter().enumerate() {
-                slots.insert(base + i as u32, func.context("element item")?);
+                let slot = base
+                    .checked_add(u32::try_from(i)?)
+                    .context("table slot overflow")?;
+                slots.insert(slot, func.context("element item")?);
             }
         }
     }
 
     Ok((slots, skipped))
-}
-
-/// The `i32.const` an active segment's offset expression is, if it is one.
-fn const_offset(expr: &wasmparser::ConstExpr<'_>) -> Option<u32> {
-    let mut reader = expr.get_operators_reader();
-    match reader.read().ok()? {
-        Operator::I32Const { value } => u32::try_from(value).ok(),
-        _ => None,
-    }
 }
 
 fn main() -> Result<()> {
@@ -118,14 +112,27 @@ fn main() -> Result<()> {
     if window > 0 {
         for slot in &found {
             println!("\n  around slot {slot}:");
-            for probe in slot.saturating_sub(window)..=slot + window {
-                if let Some(func) = slots.get(&probe) {
-                    let mark = if probe == *slot { " <-" } else { "" };
-                    println!("    [{probe}] -> #{func}{mark}");
-                }
+            for (probe, func) in
+                slots.range(slot.saturating_sub(window)..=slot.saturating_add(window))
+            {
+                let mark = if probe == slot { " <-" } else { "" };
+                println!("    [{probe}] -> #{func}{mark}");
             }
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn compound_offsets_are_skipped() {
+        let expression = wasmparser::ConstExpr::new(wasmparser::BinaryReader::new(
+            &[0x41, 3, 0x41, 4, 0x6a, 0x0b],
+            0,
+        ));
+        assert_eq!(const_offset(&expression), None);
+    }
 }

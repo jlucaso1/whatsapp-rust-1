@@ -135,6 +135,9 @@ fn write_u64(state: &HostState, ptr: u32, value: u64) -> Result<()> {
 }
 
 fn fd_write(caller: &mut Caller<'_, HostState>, fd: u32, iovs: u32, count: u32, out: u32) -> i32 {
+    if caller.data().ensure_memory_range(out, 4).is_err() {
+        return EINVAL;
+    }
     let Ok(vectors) = read_iovecs(caller.data(), iovs, count) else {
         return EINVAL;
     };
@@ -699,6 +702,87 @@ fn dispatch(name: &str, caller: &mut Caller<'_, HostState>, params: &[Val]) -> i
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_write_result_pointers_preserve_streams_files_and_offsets() {
+        use wasm_encoder::{
+            CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection, Function,
+            FunctionSection, ImportSection, MemorySection, MemoryType, Module, TypeSection,
+            ValType,
+        };
+        let mut types = TypeSection::new();
+        types.ty().function([ValType::I32; 4], [ValType::I32]);
+        types.ty().function([ValType::I32; 2], [ValType::I32]);
+        let mut imports = ImportSection::new();
+        imports.import(
+            "wasi_snapshot_preview1",
+            "fd_write",
+            EntityType::Function(0),
+        );
+        let mut functions = FunctionSection::new();
+        functions.function(1);
+        let mut memories = MemorySection::new();
+        memories.memory(MemoryType {
+            minimum: 1,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+        let mut exports = ExportSection::new();
+        exports.export("memory", ExportKind::Memory, 0);
+        exports.export("write", ExportKind::Func, 1);
+        let mut body = Function::new([]);
+        body.instructions()
+            .local_get(0)
+            .i32_const(0)
+            .i32_const(1)
+            .local_get(1)
+            .call(0)
+            .end();
+        let mut code = CodeSection::new();
+        code.function(&body);
+        let mut data = DataSection::new();
+        data.active(0, &ConstExpr::i32_const(0), [64, 0, 0, 0, 3, 0, 0, 0]);
+        data.active(0, &ConstExpr::i32_const(64), b"abc".iter().copied());
+        let mut module = Module::new();
+        module
+            .section(&types)
+            .section(&imports)
+            .section(&functions)
+            .section(&memories)
+            .section(&exports)
+            .section(&code)
+            .section(&data);
+        let bytes = module.finish();
+        for fd in [FD_STDOUT, FD_STDERR, FIRST_FILE_FD] {
+            let mut runtime = crate::Runtime::instantiate(&bytes).unwrap();
+            runtime.add_file("out", vec![9]);
+            runtime.wasi().open.insert(
+                FIRST_FILE_FD,
+                OpenFile {
+                    path: "out".into(),
+                    offset: 1,
+                    writable: true,
+                },
+            );
+            let result = runtime
+                .call("write", &[Val::I32(fd as i32), Val::I32(-1)])
+                .unwrap();
+            assert!(matches!(result[0], Val::I32(EINVAL)));
+            {
+                let wasi = runtime.wasi();
+                assert!(wasi.stdout.is_empty() && wasi.stderr.is_empty());
+                assert_eq!(wasi.file("out"), Some([9].as_slice()));
+                assert_eq!(wasi.open[&FIRST_FILE_FD].offset, 1);
+            }
+            let result = runtime
+                .call("write", &[Val::I32(fd as i32), Val::I32(32)])
+                .unwrap();
+            assert!(matches!(result[0], Val::I32(ESUCCESS)));
+            assert_eq!(runtime.read_u32_at(32).unwrap(), 3);
+        }
+    }
 
     #[test]
     fn iovec_tables_and_seek_positions_are_strict() {

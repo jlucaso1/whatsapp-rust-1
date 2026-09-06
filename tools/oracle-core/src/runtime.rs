@@ -58,8 +58,10 @@ impl Drop for Runtime {
         // this runtime. Each spawned thread sets a deadline of one epoch, and
         // nothing else ever increments, so no interruption happens until here.
         self.store.engine().increment_epoch();
-        // Bounded: a thread that will not stop must not hold up the process.
-        shared.wait_until_idle(std::time::Duration::from_secs(2));
+        let panicked = shared.workers.stop_and_join();
+        if panicked != 0 {
+            shared.log(0, format!("{panicked} worker(s) panicked during execution"));
+        }
     }
 }
 

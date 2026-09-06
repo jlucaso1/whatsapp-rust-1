@@ -263,6 +263,17 @@ fn pack_legacy(root: &Path, check: bool) -> Result<()> {
     println!("C audit corpus verified");
     Ok(())
 }
+fn checked_archive_record(archive: &[u8], mut record: Value) -> Result<Value> {
+    ensure!(
+        sha256(&cbor::decompress(archive)?)
+            == record["cbor_sha256"].as_str().context("CBOR hash")?,
+        "wasm fixture payload drift"
+    );
+    record["zstd_sha256"] = json!(sha256(archive));
+    record["packed_bytes"] = json!(archive.len());
+    Ok(record)
+}
+
 fn regenerate(root: &Path, out: &Path, cached: bool, check: bool) -> Result<()> {
     let specs = root.join("tools/oracle-core/specs");
     let lock_sha256 = sha256(&std::fs::read(specs.join("mlow.lock.json"))?);
@@ -294,14 +305,10 @@ fn regenerate(root: &Path, out: &Path, cached: bool, check: bool) -> Result<()> 
         "gennoise",
     ] {
         let source = std::fs::read(out.join(format!("artifacts/wasm_{leaf}.json")))?;
-        let (packed, record) = cbor::pack(&source)?;
+        let (packed, mut record) = cbor::pack(&source)?;
         let name = format!("wasm_{leaf}.cbor.zst");
         if check {
-            ensure!(
-                sha256(&cbor::decompress(&std::fs::read(data.join(&name))?)?)
-                    == record["cbor_sha256"].as_str().context("CBOR hash")?,
-                "wasm fixture drift: {name}"
-            );
+            record = checked_archive_record(&std::fs::read(data.join(&name))?, record)?;
         } else {
             write(&data.join(&name), &packed)?;
         }
@@ -538,6 +545,22 @@ pub fn run(root: &Path, task: Task) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archive_metadata_describes_the_committed_representation() {
+        let (mut packed, generated) = cbor::pack(br#"[1,2,3]"#).unwrap();
+        let payload = cbor::decompress(&packed).unwrap();
+        // A valid empty skippable frame changes zstd bytes without changing CBOR.
+        packed.extend_from_slice(&[0x50, 0x2a, 0x4d, 0x18, 0, 0, 0, 0]);
+        assert_eq!(cbor::decompress(&packed).unwrap(), payload);
+        let actual = checked_archive_record(&packed, generated.clone()).unwrap();
+        assert_eq!(actual["zstd_sha256"], sha256(&packed));
+        assert_eq!(actual["packed_bytes"], packed.len());
+        assert_ne!(
+            actual, generated,
+            "stale metadata must fail manifest comparison"
+        );
+    }
 
     #[test]
     fn manifest_comparison_ignores_only_intermediate_json_rendering() {
