@@ -84,11 +84,12 @@
 //! cargo run --release --example outbound_setup_matrix
 //! cargo run --release --example outbound_setup_matrix -- JgwtTQVeWPm
 //! ```
+mod common;
+
 use base64::Engine as _;
-use oracle_core::{Catalog, Runtime, ThreadPolicy, Value};
-use wacore_binary::builder::NodeBuilder;
+use oracle_core::{Catalog, Runtime, Value};
 use wacore_binary::jid::Server;
-use wacore_binary::{Jid, Node, marshal};
+use wacore_binary::{Jid, marshal};
 
 const SETTINGS: &[u8] =
     br#"{"encode":{"use_mlow_codec_v1":"false"},"options":{"enable_48khz_rtp_clock":"false","caller_timeout":"45"}}"#;
@@ -186,61 +187,6 @@ const ARMS: &[Arm] = &[
     },
 ];
 
-fn offer_stanza(caller: &Jid, now: u64) -> Node {
-    NodeBuilder::new("call")
-        .attr("from", caller.clone())
-        .attr("call-id", "0102030405060708")
-        .attr("call-creator", caller.with_device(1))
-        .attr("t", now.to_string())
-        .children([
-            NodeBuilder::new("offer")
-                .children([
-                    NodeBuilder::new("audio")
-                        .attr("enc", "opus")
-                        .attr("rate", "16000")
-                        .build(),
-                    NodeBuilder::new("net").attr("medium", "3").build(),
-                    NodeBuilder::new("encopt").attr("keygen", "2").build(),
-                ])
-                .build(),
-            NodeBuilder::new("voip_settings")
-                .attr("uncompressed", "1")
-                .bytes(SETTINGS.to_vec())
-                .build(),
-        ])
-        .build()
-}
-
-fn engine(bytes: &[u8]) -> anyhow::Result<Runtime> {
-    const ATTEMPTS: usize = 8;
-    for _ in 0..ATTEMPTS {
-        let mut r = Runtime::instantiate(bytes)?;
-        r.set_thread_policy(ThreadPolicy::Spawn);
-        r.set_main_thread_registration(true);
-        r.run_ctors()?;
-        r.attach_log_ring(4 << 20)?;
-        // Arm the marker mirror. `oracle instrument` splices calls to this
-        // import, and until the sink is named nothing is recorded — so an
-        // instrumented run reads exactly like an uninstrumented one, and a
-        // marker that never fires looks the same as a marker never watched.
-        // That mistake cost one round of this experiment.
-        r.shared().watch_markers("env::on_call_event_js_sync");
-        let init = r.call_embind(
-            "initVoipStack",
-            &[
-                Value::Str(SELF.into()),
-                Value::Str(SELF_DEVICE.into()),
-                Value::Str(SELF_LID.into()),
-            ],
-        );
-        r.refuel();
-        if init.as_ref().ok().and_then(|v| v.as_int()) == Some(0) {
-            return Ok(r);
-        }
-    }
-    anyhow::bail!("initVoipStack never returned 0 in {ATTEMPTS} attempts")
-}
-
 fn set_ab_props(r: &mut Runtime) -> usize {
     let mut set = 0;
     for (key, kind) in AB_PROPS {
@@ -268,8 +214,9 @@ fn set_ab_props(r: &mut Runtime) -> usize {
 fn load_settings(r: &mut Runtime) -> anyhow::Result<()> {
     let caller = Jid::new("11223344556677", Server::Lid);
     let now = r.virtual_unix_time();
-    let payload = base64::engine::general_purpose::STANDARD
-        .encode(marshal::marshal(&offer_stanza(&caller, now))?);
+    let payload = base64::engine::general_purpose::STANDARD.encode(marshal::marshal(
+        &common::settings_offer(&caller, now, "0102030405060708", SETTINGS),
+    )?);
     r.call_embind(
         "handleIncomingSignalingOffer",
         &[
@@ -341,7 +288,16 @@ fn main() -> anyhow::Result<()> {
 
     for arm in ARMS {
         println!("=== {}", arm.label);
-        let mut r = engine(&bytes)?;
+        let mut r = common::engine(
+            &bytes,
+            common::Startup {
+                identity: [SELF, SELF_DEVICE, SELF_LID],
+                attempts: 8,
+                register_main: true,
+                log_bytes: 4 << 20,
+                marker_sink: Some("env::on_call_event_js_sync"),
+            },
+        )?;
 
         if arm.ab_props {
             println!(

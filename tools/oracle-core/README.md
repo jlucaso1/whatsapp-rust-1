@@ -16,6 +16,9 @@ The modules are not vendored — they are WhatsApp's artifacts, and a copy
 committed here would drift from the capture every offset in this file was read
 out of.
 
+Historical measurements and superseded hypotheses are in the
+[investigation archive](../../agent_docs/voip_oracle_history.md).
+
 ## Getting set up
 
 ```sh
@@ -266,80 +269,17 @@ embind signature:
   (`invalid list size`); keeping it parses cleanly. Only the real implementation
   could settle that one-byte question.
 
-## What a zero-returning stub costs
-
-Every piece of the host environment here exists because stubbing it produced a
-hang or a wrong answer, not because a spec said to implement it:
-
-| stub | what it did |
-| --- | --- |
-| `emscripten_get_now` → 0 | startup busy-waited: **34 million calls** before the fuel ran out |
-| `fd_write` → "wrote nothing" | libc retried forever: **3.2 million calls** |
-| `invoke_*` → no-op | silently skipped **every static initialiser**, so the embind API looked empty |
-| `__pthread_create_js` → success | reported a thread that never ran; whatever waited on it hung |
-| `__cxa_*` → 0 | every `try`/`catch` broke, turning recoverable errors into opaque traps |
-| a memory window read once | WASI wrote arguments into a stale window and reported success, so every media tool behaved as if invoked with no arguments — and exited 71 from inside its own panic handler |
-
-`EM_ASM` is handled by source text when the module embeds it. Three stripped
-selectors needed by the pinned VOPRF and VoIP captures are keyed by the hash of
-their data section and index; every other missing, unreadable or unknown
-snippet traps. The data fingerprint survives instrumentation, which rewrites
-only code, while keeping a selector address from one capture from acquiring
-meaning in another module that happens to use the same number.
-
-With those implemented, `initVoipStack` returns, `handleIncomingSignalingOffer`
-completes without raising, and a genuine C++ error arrives readable:
-`std::invalid_argument: stoull: no conversion`.
-
 ## Real threads
 
-`ThreadPolicy::Spawn` starts guest threads for real. A wasm thread is not a host
-thread running guest code — it is a **separate instance of the same module, on
-its own `Store`, over the same shared memory**, which is what emscripten's Web
-Worker glue does. The function table is per-instance but identical in each, so a
-function pointer means the same thing everywhere.
+`ThreadPolicy::Spawn` creates a separate instance and `Store` for each worker,
+over the same shared memory. Each worker installs the stack allocated by the
+guest, initializes pthread/TLS state, and reports initialization failures.
+The main thread uses `can_block = 0` so waits can yield to host code.
+`Runtime::drop` stops and joins the workers.
 
-It is what brings the VoIP media stack up:
-
-```
-                       Refuse            Spawn
-initVoipStack          120011            0
-                       (EAGAIN)          endpoint.c  worker thread started
-                                         wa_media_api. pjmedia_endpt_create = 0
-                                         wa_opus.c   pjmedia_codec_opus_init success
-                                         wa_call_event call_event_proc started
-```
-
-One more piece was needed: emscripten initialises the *main* thread through
-`__emscripten_init_main_thread_js`, and while that was stubbed the runtime
-believed no thread was the main one. Nothing failed immediately — but the first
-time a worker tried to coordinate with the main thread, the main thread spun
-forever waiting for one that never identified itself.
-
-**Each guest thread now runs on the stack the guest allocated for it.** The
-stack pointer is a per-instance global, so a new instance would otherwise start
-from the module's initial `0x24cf60` and push its frames over whatever the main
-thread has live there. `threads.rs` does what emscripten's `establishStackSpace`
-does: reads the 64 KiB region out of `struct pthread` and installs it with
-`emscripten_stack_set_limits` and `stackRestore`.
-
-This had been tried three times and recorded as making things worse. What was
-missing was a signal sharp enough to judge it — the earlier attempts were scored
-on `startVoipCall`, which fails for unrelated reasons. `oracle instrument` gives
-one: mark `~basic_string`'s deallocator and ask whether it is handed a pointer
-or a small integer.
-
-| | shared stack | per-thread stack |
-| --- | --- | --- |
-| `initVoipStack` | 8/12, then 20/20 | **12/12, 20/20** |
-| last value freed | `1`, `2` on the trapping rounds | **always a pointer** |
-| `threading` suite | 12 tests, 262 s | **13 tests, 169 s** |
-
-The fault it fixes is worth stating precisely, because it was read as a race for
-a long time: a `std::string` built in func 724's own frame was overwritten by
-another thread's frame, so `__is_long_` read as set while `__data_` held a
-neighbour's local, and `~basic_string` reached `free(1)`. See "A deleter is
-handed the integer 1" in `agent_docs/voip_oracle_status.md`.
+Main-runtime registration remains disabled by default: synchronous proxy
+queue draining can block startup. Experiments may opt in explicitly through
+`set_main_thread_registration`; this does not establish complete call coverage.
 
 ## Determinism
 
@@ -349,12 +289,10 @@ observation, a seeded SplitMix64 PRNG behind `getentropy` / `random_get` /
 instances given the same input produce identical results *and* identical
 host-call traces, which `tests/host_environment.rs` asserts.
 
-**Threads cost some of that.** `schedule.rs` gives back the largest piece: at
-most one guest thread executes at a time, handing off at host calls. That is
-what took the VoIP engine's startup race from about one failure in nine to one
-in forty — two guest threads can no longer be inside guest code at once. It does
-not make a run reproducible on its own, because which thread wins the next turn
-is still the OS's choice.
+**Guest threads can execute concurrently.** The cooperative scheduler has a
+timeout escape and cannot establish mutual exclusion. Shared-memory host
+accesses use atomic bytes; multi-byte snapshots can still tear. Per-thread
+stacks prevent workers from overwriting each other's stack frames.
 
 The rest of what the harness gives back:
 
@@ -362,181 +300,30 @@ The rest of what the harness gives back:
 | --- | --- |
 | One clock behind a lock, shared by every thread | Time never runs backwards when execution crosses threads — the first thing a deadline loop would notice |
 | A seeded PRNG **per thread**, keyed on the thread id | Each thread's sequence depends only on how many bytes *that* thread took. One shared stream would not survive threading: it is reproducible only if consumed in a reproducible order, and two runs can interleave their `random_get` calls differently |
-| Every log line carries a global sequence number | The transcript can be put back in a stable order regardless of how the OS scheduled the writers |
+| Every log line carries a global sequence number | The transcript preserves the observed order of that run; another run may interleave differently |
 | `emscripten_num_logical_cores` returns a fixed 4 | Worker-pool sizes do not depend on the machine the tests run on |
 | `quiesce(timeout)` waits for every thread to finish | The *interleaving* is not reproducible, but the state after all threads have settled generally is. Reading before quiescing is a race with the module's own workers |
-| One guest thread runnable at a time (`schedule.rs`) | No data races between guest threads. `forced_turns()` reports when a thread had to run without a turn — the escape hatch that keeps a waiting guest from hanging the host |
+| Cooperative scheduling (`schedule.rs`) | `forced_turns()` records timeout escapes; neither a held turn nor a zero counter establishes memory safety |
 
 What that buys is a weaker but honest property: **milestones are reproducible,
 interleaving is not.** `tests/threading.rs` asserts the former and deliberately
 does not assert the latter — a test demanding identical thread interleaving
 would be flaky by construction.
 
-## What the offer format turned out to be
-
-Established one engine complaint at a time, and none of it is guessable from the
-embind signature:
-
-| | |
-| --- | --- |
-| `call-id` | on the **`<call>`**, not the `<offer>` — otherwise `empty call-id` |
-| `<voip_settings>` | a **sibling** of `<offer>`, not a child — otherwise `missing voip_settings` |
-| `<voip_settings uncompressed="1">` | without the attribute the blob is read as compressed and the whole offer is rejected |
-| arguments 4 and 5 | the stanza's `e` and `t` timestamps, read with `stoull` |
-| timestamps | on the **guest's** clock (`virtual_unix_time`) — the host clock starts in 2021, so a real timestamp is from the future |
-| the payload | base64 of the encoded stanza **including** the transport flag byte, though the JS glue drops it |
-
-The `uncompressed="1"` answer came from whatsapp-rust, which sets the same
-attribute when it builds an accept — a case of the two implementations checking
-each other, which is the point of having both.
-
 ## Working out an unknown module
 
-A stripped module tells you `(i32, i32, i32) -> i32` and nothing about what
-those integers are. `oracle abi` reads the function's own code: an argument
-dereferenced as an address is a pointer, and the access width says what it
-points at; one that only bounds a loop is a length; one passed straight through
-is a handle.
+Start with `oracle inspect <id>` for imports, exports and toolchain, then
+`oracle strings <id>` for data-segment strings. `oracle embind <id>` lists a
+registered API; `oracle abi <id>` infers roles from bytecode without execution.
 
-```console
-$ oracle abi php8T1oSIZM -f z
-z (function #273)
-  arg0  handle (passed through)            stored as a value x1, arithmetic x1
-  arg1  length or count                    compared x1, forwarded x1
-  arg2  handle (passed through)            stored as a value x1
-  arg3  handle (passed through)            stored as a value x1
-  arg4  length or count                    compared x1
-  arg5  length or count                    compared x1
-```
+Use `abi --index N` for a trap frame and `abi --slot N` for an indirect-call
+target. A trampoline's arguments belong to its callee: read the live object's
+vtable before interpreting them. ABI roles are static evidence, not proof;
+branches and recycled locals can limit the inference.
 
-It needs no name section, no glue and no debug info, so it works on any module —
-including ones not captured yet. `tests/abi_inference.rs` runs it across
-toolchains: minified C++ and Rust/WASI alike.
-
-**A trap frame is a way in.** A wasm backtrace names its frames by index and
-nothing else, so `--index` takes one and gives back a name and a body. Constants
-that address static text are quoted inline, which on a minified module is often
-the only readable thing left:
-
-```console
-$ oracle abi php8T1oSIZM --index 53
-func[53] (function #53)
-  body:
-    i32.const 211967  ; "called `Option::unwrap()` on a `None` value"
-    i32.const 43
-    call 146
-    unreachable
-```
-
-That is how the mozjpeg module was worked out. Every call to `z` aborted in
-`wasm function 151`; `--index` walked the frames to a Rust panic, and reading
-`z`'s own body from there gave the six arguments: a `i64.store offset=180` of
-`0xC_00000004` is `input_components = 4` next to `in_color_space = 12`, which is
-libjpeg-turbo's `JCS_EXT_RGBA`. The pixels are RGBA, which is what every earlier
-attempt had wrong.
-
-**Trampolines are named as such**, because they change what a caller has to do:
-
-```console
-$ oracle abi COs9e0Kj0ic -f blind
-blind (function #183)
-  arg0  pointer (read, 4-byte access)      loaded 4B, forwarded x1
-  arg1..6 handle (passed through)
-  body:
-    local.get 0 … local.get 6
-    local.get 0
-    i32.load offset=12       ← function pointer out of the object
-    call_indirect type=12
-    ^ trampoline: the real arguments belong to its callee.
-```
-
-`blind` takes no arguments of its own: it loads a function pointer from offset
-12 of its first argument and jumps through it. So the first argument is an
-object with a vtable, and `oracle abi <id> --slot N` follows that slot to the
-function that really takes the arguments. Reading the slot out of a live object
-(`examples/voprf_flow.rs`) shows which objects have it filled in — a Ristretto
-curve carries slot 2, a VOPRF context slot 21, and an uninitialised KDF carries
-nothing callable, which is exactly the difference between a call that works and
-one that traps.
-
-The output is evidence, not proof, and the limits are documented in `abi.rs`.
-The scan is linear, so it follows one path: a parameter only touched inside a
-branch comes back thinner than it is, and a slot the optimiser recycled as a
-temporary is retired at the first store that does not write the parameter back —
-evidence is given up rather than invented. That is why the counts are printed
-next to the role rather than hidden behind it.
-
-### A missing export must never be silent
-
-The host asked for `__emscripten_thread_init`; the module exports
-`_emscripten_thread_init`. The lookup was `let Some(..) = get_export(..) else {
-return; }`, so nothing failed — the main thread simply never registered itself,
-`emscripten_main_thread_process_queued_calls` then asserted
-`emscripten_is_main_runtime_thread()` and trapped, and every call a worker
-thread queued for the main thread was dropped. One underscore, and the symptom
-thousands of instructions from the cause.
-
-`exports.rs` is the answer: every lookup goes through it, a miss is always
-reported, and the report names the near misses — normalising leading
-underscores and case, which is exactly the class of difference a reader skips
-over.
-
-```
-module exports no function named any of ["__emscripten_thread_init"];
-  the module does export ["_emscripten_thread_init"] — spelling?
-```
-
-An optional export logs its own absence rather than returning `None` quietly,
-because "this module has no `setTempRet0`" is a fact worth seeing when
-behaviour later looks wrong.
-
-### One flag was the startup race, the hang and the slowness
-
-`initVoipStack` used to trap about one attempt in six, and the scheduler in
-`schedule.rs` could only narrow it. It was read as a race inside the engine.
-It was not: it was `can_block`.
-
-`__emscripten_thread_init(ptr, is_main, is_runtime, can_block, ...)` decides
-which wait a thread takes, and this host passed `1`. Emscripten itself passes
-`canBlock: !ENVIRONMENT_IS_WEB` — **zero on the web**, because a browser's main
-thread cannot use `Atomics.wait` either:
-
-```c
-// system/lib/pthread/emscripten_futex_wait.c
-// For the main browser thread and audio worklets we can't use
-// __builtin_wasm_memory_atomic_wait32 so we have busy wait instead.
-if (!_emscripten_thread_supports_atomics_wait())
-  return futex_wait_main_browser_thread(addr, val, max_wait_ms, cancelable);
-```
-
-With `1`, a waiting main thread takes `memory.atomic.wait32` — a wait that
-happens *inside* wasm, with no host call. It holds its scheduler turn while
-blocked, and the thread that would notify it never gets one. Deadlock, until
-the turn times out five seconds later; that timeout was the "slowness", and the
-forced turn was the "race".
-
-With `0` it takes emscripten's own busy-wait, which calls `_emscripten_yield`
-each time round. That is a host call, so the turn is yielded *and* the proxying
-queue drains. Both problems close together:
-
-```
-                        can_block = 1     can_block = 0
-initVoipStack           16/20             60/60
-forced turns            non-zero          0
-main-thread queue       traps             drains
-```
-
-Registering the instantiating thread as the main runtime thread is on by
-default as a result, which is what `emscripten_main_thread_process_queued_calls`
-requires.
-
-The sentence that used to follow — that draining that queue is how the VoIP
-engine's outbound signaling leaves, through table slot 436 — was wrong twice.
-The trampoline that calls `sendSignalingXMPP_js_sync` is function **#855** at
-slot **464** (`cargo run --example table_slot_of -- <module> 855`), and the
-engine reaches it with or without main-thread registration: outbound signaling
-is delivered on a bare engine, measured through the call *counters*. See
-"Counting host calls" below.
+Export lookup uses `exports.rs`: missing exports report aliases and near
+matches instead of silently skipping initialization. Capture-specific examples
+and investigation results are retained in the history document.
 
 ### Reading the outbound signaling
 
@@ -570,35 +357,16 @@ sharing no lineage with the engine — decodes it:
 
 ### Counting host calls
 
-Three accessors answer "did the guest call this", and **two of them return zero
-for reasons that have nothing to do with the guest**. An investigation into the
-VoIP engine's outbound path ran for several rounds on such a zero and reached
-the opposite of the truth, so this is worth reading before trusting one.
+| accessor | evidence |
+| --- | --- |
+| `all_calls_to(sym)` / `shared().calls()` | First 8192 host calls, with arguments |
+| `shared().hot_calls()` / `total_calls()` | Exact counters throughout the run |
+| `stubs_called()` | Exact counts restricted to unimplemented imports |
 
-| accessor | what it really answers |
-|---|---|
-| `all_calls_to(sym)` / `shared().calls()` | the **first 8192** host calls of the run, with arguments |
-| `shared().hot_calls()` / `total_calls()` | exact counts, unbounded |
-| `stubs_called()` | only imports that got a **stub**; one with a real implementation never appears |
-
-Bringing the VoIP engine up makes roughly **39 million** host calls, so the
-recorded-call list is full within moments and every later query finds nothing.
-
-```rust
-// whether something happened — counters, exact
-let sent = runtime.shared().hot_calls().iter()
-    .find(|(s, _)| s == "env::sendSignalingXMPP_js_sync").map(|(_, n)| *n).unwrap_or(0);
-
-// with what arguments — empty the list first, then measure a short stretch
-runtime.shared().clear_trace();
-runtime.call_embind("startVoipCall", &args)?;
-for call in runtime.all_calls_to("env::sendSignalingXMPP_js_sync") { /* … */ }
-```
-
-`watch_markers` has the same shape of hazard: an instrumented copy records
-nothing until the sink is named, so "the marker never fired" and "the marker was
-never watched" are indistinguishable. Put a marker on a function you *know* runs
-as a control before believing one that stays silent.
+Use counters to establish whether an import ran. Clear the argument trace
+before a short experiment when arguments matter; VoIP startup can fill it.
+Marker recording requires `watch_markers` with the selected sink. A missing
+probe or a saturated trace cannot establish that a callback never ran.
 
 ### Imports that cannot be recognised by name
 
@@ -665,104 +433,39 @@ Hand-built MP4s get as far as the H.264 parser and no further — these tools
 validate the elementary stream, not just the container, which is exactly what
 makes them worth using as a specification.
 
-## Differential testing
+## Differential testing and runtime
 
-`tests/differential.rs` is the template for comparing against whatsapp-rust: the
-oracle supplies ground truth, Rust supplies the candidate, and the test sweeps a
-range of inputs.
+`tests/differential.rs` supplies the pattern: execute the pinned capture,
+compare with an independent Rust implementation, and sweep boundary inputs.
+Numerical ordering and precision matter even when a simpler formula agrees
+on a few samples.
 
-It has already paid for itself. `convertFixed32BitToFloat` looked like
-`value / 2^n`, and that formula passes for every `n < 25`. The sweep found that
-the module returns `0` for `f(-1, 30)` where the formula returns `-9.3e-10`,
-because the module adds an integer part and a fraction **in `f32`** and the
-fraction rounds to exactly `1.0`, cancelling the integer part. A hand-written
-test at a couple of points would have shipped the wrong model.
+Inspection uses streaming `wasmparser` reads. Execution uses Wasmtime with an
+explicit feature set, Cranelift at `OptLevel::None`, and an on-disk compilation
+cache keyed by module bytes and compiler configuration. Check the manifest
+before changing the runtime feature budget.
 
-## Runtime and dependencies
-
-**Inspection compiles nothing.** `oracle inspect` reads the module with
-`wasmparser` and resolves signatures by hand from the type, import, function and
-export sections. A 9.3 MB module is inspected in **8 ms**. The same information
-used to cost a full compile.
-
-**The engine log is read, not scanned.** The ring buffer has a 24-byte header
-carrying the number of bytes written; `engine_log()` reads that count instead of
-searching the allocation for printable runs. The earlier version was effectively
-a memory scan, so unrelated heap bytes came back as extra log lines and two
-probes of the same input could disagree — which is exactly what stalled the
-offer investigation. `engine_log_overflowed()` reports when the ring has wrapped,
-because past that point an index from an earlier read no longer means anything.
-
-**And it refuses when it cannot be trusted.** `memory_view_is_coherent()`
-re-reads a slice of the module's own static data, sampled once its constructors
-placed it, and `engine_log()` returns nothing when that slice no longer matches.
-It was written for a fault that destroyed the whole of linear memory about one
-run in four — the host reading `env::get_random_bytes_js` as `(buf, len)` when
-the module calls it `(len, buf)`, turning a 32-byte key request into fifteen
-megabytes of PRNG written from address 32. That is fixed (see "The host was
-writing the key material itself" in `agent_docs/voip_oracle_status.md`); the refusal stays,
-because an oracle that answers from the wrong memory is worse than one that
-declines to answer.
-
-**Execution caches.** Compiled modules are cached on disk by wasmtime, keyed on
-their bytes and the compiler settings. The captured modules never change, so
-after the first run Cranelift is skipped entirely — which matters because the
-harness builds a fresh instance per test and another per guest thread.
-
-| | cold | warm |
-| --- | --- | --- |
-| `oracle call` on the 9.3 MB VoIP module | 4.0 s | **0.16 s** |
-| full test suite (40 tests) | — | **15 s** |
-
-**Dependencies are trimmed to what is used.** wasmtime is built with
-`default-features = false`: the component model, GC, async, the Winch backend,
-the WAT parser and debug tooling are all dead weight for a harness that runs
-plain core-wasm modules off disk. `wasmi` was removed entirely once inspection
-stopped needing a second runtime.
-
-| | before | after |
-| --- | --- | --- |
-| clean release build | 1m 05s | **10.7 s** |
-| `oracle` binary | 26.1 MB | **18.1 MB** |
-| dependencies compiled | 380 | **237** |
-
-Cranelift also runs at `OptLevel::None`: the oracle calls each function a
-handful of times, so optimising the generated code costs more than it saves.
-
-### What was lost
-
-`wasmi` used to answer a second question — whether a module would load under a
-`no_std` interpreter, i.e. whether it could ever be embedded. That signal is now
-read straight from the module instead: `oracle inspect` reports a **shared
-memory** as a threads requirement, which is what actually decides it. Cheaper,
-and it cannot drift with a runtime version.
+Engine logs are read through the ring header, not by scanning memory for text.
+`engine_log_overflowed()` returns a result: propagate a failed overflow probe
+rather than treating missing log lines as evidence. The coherence probe can
+reject logs after guest-memory corruption.
 
 ## Known limits
 
-- **An offer is accepted but not answered.** The engine now returns
-  `wa_call_handle_incoming_xmpp_offer() status 0` and records the call, but ends
-  it with `EVENT: Call missed by the user` and emits no outbound signaling. Two
-  loose ends: the caller resolves to `0@s.whatsapp.net` (WhatsApp Web reads that
-  attribute with `attrDeviceJid`, but passing a device JID changes nothing), and
-  `record_incoming_msg: no active call` suggests something else has to create
-  the call before an offer can be answered.
-- **`ThreadPolicy` is a choice, not a default to ignore.** `Refuse` keeps a run
-  fully reproducible and fails PJSIP's init; `Spawn` gets the engine running and
-  weakens reproducibility to the milestone level. `PretendSuccess` exists for
-  modules that only need a spawn to *appear* to work, and does not help here.
-- **`getVoipParam` throws** before `initVoipStack`, and returns empty after.
-  Genuine engine behaviour, and a useful signal that init took effect.
-- **Only vector classes are marshalled.** `Uint8List`, `StringList` and `IntList`
-  round-trip in both directions; a class with a non-default constructor or a
-  non-vector shape would need its own path. Unsupported types are refused, never
-  guessed.
-- **Threads are refused, not emulated.** A module that genuinely requires a
-  worker thread to make progress cannot run here.
-
-The VOPRF module registers no embind API at all — it exposes plain C exports
-(`sodiumInit`, `curve_init_ristretto`, `voprf_evaluate`). That is the correct
-result for it, not a recovery failure, and a test pins it so the distinction
-stays visible.
+- Full audio/video callback ABIs and end-to-end signaling/IQ equivalence remain
+  work for differential adapters. See the [coverage matrix](../../agent_docs/voip_conformance.md).
+  The 26 ignored signaling scenarios are not proof of conformance.
+- `Refuse` rejects worker creation; `Spawn` permits real concurrent workers.
+  `PretendSuccess` is a diagnostic hypothesis and does not run a worker.
+  Concurrent interleavings are not reproducible.
+- Main-thread proxy draining is not fully modeled; observe actual callbacks
+  and counters rather than inferring an absent send from incomplete diagnostics.
+- `getVoipParam` requires initialization and settings supplied through the
+  captured engine's settings path. An empty result is not a universal default.
+- Vector classes (`Uint8List`, `StringList`, `IntList`) are supported. Other
+  object layouts and unsupported wire types require explicit implementations.
+- The VOPRF module exposes plain C exports rather than embind; an empty embind
+  registry is expected for that module.
 
 ## Layout
 
@@ -776,7 +479,7 @@ tools/oracle-core
   runtime.rs      one instance: calling it, its log ring, its lifetime
   shared.rs       cross-thread state: trace, clock, thread bookkeeping
   threads.rs      real guest threads over one shared memory
-  schedule.rs     one guest thread runnable at a time, handing off at host calls
+  schedule.rs     cooperative turns with timeout escape; not mutual exclusion
   emscripten.rs   deterministic clock/PRNG, invoke_* trampolines
   cxa.rs          C++ exception handling
   wasi.rs         deterministic WASI preview-1 subset with an in-memory filesystem
@@ -826,3 +529,21 @@ tool; it is not affiliated with, authorised by, or endorsed by WhatsApp or Meta.
 J/S captures. The lock verifies every output and selector; the capture CI
 runs both modules independently. See [mlow_derivation.md](../../agent_docs/mlow_derivation.md) for the
 recovered layouts, DSP boundaries, migration refusals and measured results.
+
+## Task layout and generated specs
+
+`cargo xt` compiles only the lightweight repository dispatcher for hashes,
+descriptors and CI metadata. Its `mlow` and `oracle` commands launch
+`whatsapp-oracle-task` in release mode, where capture acquisition, derivation,
+patches, media comparison and conformance are separate modules.
+
+`cargo xt mlow specs` expands the committed bases and typed recipes into
+`.derive-mlow/specs/`; `--check` compares generated bytes against the committed
+hashes without requiring expanded files in Git. Verification materializes the
+same specs automatically. CI publishes them with the run manifests.
+
+WASI files, descriptors, arguments and streams belong to the process and are
+shared by workers. `Runtime::wasi()` returns a lock guard: release it before
+calling guest code. Unsupported `path_open` descriptor flags (including append)
+return `EINVAL` before any file mutation. `oracle run --log` reports unsupported
+logging explicitly.

@@ -17,27 +17,20 @@
 //!   * Loading settings first changes **nothing** about that: both arms are
 //!     identical, 39 log lines each, same states, same offer.
 //!
-//! **WARNING — this example's `sent=` column is not to be trusted.** It reads
-//! `all_calls_to`, which returns the recorded-call *list*; that list stops
-//! growing at `MAX_TRACE` (8192) and engine startup alone makes ~39 **million**
-//! host calls, so it answers zero for everything regardless of what happened.
-//! Every `sent=0` this example printed was that artefact.
-//!
-//! `outbound_setup_matrix` measures the same thing correctly, through
-//! `shared().hot_calls()`, and finds the offer **is** delivered:
-//! `sendSignalingXMPP_js_sync(peer_jid, call_id, stanza, 179)`, on a bare
-//! engine, in every arrangement. Read that one instead; this is kept for the
-//! settings A/B, which is unaffected because it reads `getVoipParam` directly.
+//! Send counts use exact host counters even after the argument trace fills.
+//! Earlier measurements using the bounded trace are archived in
+//! `agent_docs/voip_oracle_history.md`.
 //!
 //! ```sh
 //! cargo run --release --example outbound_after_settings
 //! NO_MAIN_THREAD=1 cargo run --release --example outbound_after_settings
 //! ```
+mod common;
+
 use base64::Engine as _;
-use oracle_core::{Catalog, Runtime, ThreadPolicy, Value};
-use wacore_binary::builder::NodeBuilder;
+use oracle_core::{Catalog, Runtime, Value};
 use wacore_binary::jid::Server;
-use wacore_binary::{Jid, Node, marshal};
+use wacore_binary::{Jid, marshal};
 
 const SETTINGS: &[u8] =
     br#"{"encode":{"use_mlow_codec_v1":"false"},"options":{"enable_48khz_rtp_clock":"false","caller_timeout":"45"}}"#;
@@ -50,65 +43,6 @@ const PEER_LID: &str = "11223344556677@lid";
 const PEER_LID_DEVICE: &str = "11223344556677:0@lid";
 const OUTGOING_CALL_ID: &str = "0011223344556677";
 const INCOMING_CALL_ID: &str = "0102030405060708";
-
-/// An incoming offer whose only job is to carry the settings blob.
-fn offer_stanza(caller: &Jid, now: u64) -> Node {
-    NodeBuilder::new("call")
-        .attr("from", caller.clone())
-        .attr("call-id", INCOMING_CALL_ID)
-        .attr("call-creator", caller.with_device(1))
-        .attr("t", now.to_string())
-        .children([
-            NodeBuilder::new("offer")
-                .children([
-                    NodeBuilder::new("audio")
-                        .attr("enc", "opus")
-                        .attr("rate", "16000")
-                        .build(),
-                    NodeBuilder::new("net").attr("medium", "3").build(),
-                    NodeBuilder::new("encopt").attr("keygen", "2").build(),
-                ])
-                .build(),
-            NodeBuilder::new("voip_settings")
-                .attr("uncompressed", "1")
-                .bytes(SETTINGS.to_vec())
-                .build(),
-        ])
-        .build()
-}
-
-/// `initVoipStack` fails intermittently, so a single attempt reads as "the arm
-/// was not measured" when it is really "the engine did not start". Same retry
-/// `outgoing_call` and `tests/signaling.rs` carry.
-fn engine(bytes: &[u8]) -> anyhow::Result<Runtime> {
-    const ATTEMPTS: usize = 8;
-    for _ in 0..ATTEMPTS {
-        let mut r = Runtime::instantiate(bytes)?;
-        r.set_thread_policy(ThreadPolicy::Spawn);
-        // Register as emscripten's main runtime thread, which is what gives the
-        // proxy queue a thread that may drain it — and the outbound signaling
-        // callback is dispatched through that queue. Without it, "nothing was
-        // dispatched" would be a property of the harness rather than of the
-        // engine. `outgoing_call` documents the trade: it makes this path
-        // deterministic and breaks two `tests/signaling.rs` cases.
-        r.set_main_thread_registration(std::env::var("NO_MAIN_THREAD").is_err());
-        r.run_ctors()?;
-        r.attach_log_ring(4 << 20)?;
-        let init = r.call_embind(
-            "initVoipStack",
-            &[
-                Value::Str(SELF.into()),
-                Value::Str(SELF_DEVICE.into()),
-                Value::Str(SELF_LID.into()),
-            ],
-        );
-        r.refuel();
-        if init.as_ref().ok().and_then(|v| v.as_int()) == Some(0) {
-            return Ok(r);
-        }
-    }
-    anyhow::bail!("initVoipStack never returned 0 in {ATTEMPTS} attempts")
-}
 
 fn caller_timeout(r: &mut Runtime) -> String {
     let answer = r.call_embind(
@@ -197,8 +131,9 @@ fn set_ab_props(r: &mut Runtime) -> usize {
 fn load_settings(r: &mut Runtime) -> anyhow::Result<()> {
     let caller = Jid::new("11223344556677", Server::Lid);
     let now = r.virtual_unix_time();
-    let payload = base64::engine::general_purpose::STANDARD
-        .encode(marshal::marshal(&offer_stanza(&caller, now))?);
+    let payload = base64::engine::general_purpose::STANDARD.encode(marshal::marshal(
+        &common::settings_offer(&caller, now, INCOMING_CALL_ID, SETTINGS),
+    )?);
 
     r.call_embind(
         "handleIncomingSignalingOffer",
@@ -228,7 +163,7 @@ fn load_settings(r: &mut Runtime) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn originate(r: &mut Runtime) -> (String, Vec<String>, usize) {
+fn originate(r: &mut Runtime) -> (String, Vec<String>, u64) {
     let mark = r.engine_log().len();
     let result = r.call_embind(
         "startVoipCall",
@@ -284,7 +219,7 @@ fn originate(r: &mut Runtime) -> (String, Vec<String>, usize) {
         r.live_threads()
     );
 
-    let sent = r.all_calls_to("env::sendSignalingXMPP_js_sync").len();
+    let sent = call_count(r, "env::sendSignalingXMPP_js_sync");
     (shown, r.engine_log_from(mark), sent)
 }
 
@@ -305,7 +240,16 @@ fn main() -> anyhow::Result<()> {
             "=== outgoing call {} settings loaded first",
             if load { "WITH" } else { "WITHOUT" }
         );
-        let mut r = engine(&bytes)?;
+        let mut r = common::engine(
+            &bytes,
+            common::Startup {
+                identity: [SELF, SELF_DEVICE, SELF_LID],
+                attempts: 8,
+                register_main: std::env::var("NO_MAIN_THREAD").is_err(),
+                log_bytes: 4 << 20,
+                marker_sink: None,
+            },
+        )?;
         if load {
             println!(
                 "  setABProp* accepted {} of {}",
@@ -338,7 +282,7 @@ fn main() -> anyhow::Result<()> {
             "env::call_sendto",
             "env::on_call_event_js_sync",
         ] {
-            println!("    {symbol:<48} {} call(s)", r.all_calls_to(symbol).len());
+            println!("    {symbol:<48} {} call(s)", call_count(&r, symbol));
         }
         println!(
             "    sender has a recording stub: {}",
@@ -372,4 +316,13 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn call_count(runtime: &Runtime, symbol: &str) -> u64 {
+    runtime
+        .shared()
+        .hot_calls()
+        .iter()
+        .find(|(name, _)| name == symbol)
+        .map_or(0, |(_, count)| *count)
 }

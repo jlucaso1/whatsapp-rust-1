@@ -326,7 +326,15 @@ pub fn compare_media(expected: &[MediaObservation], actual: &[MediaObservation])
             expected.stream == actual.stream
                 && expected.sequence == actual.sequence
                 && expected.timestamp == actual.timestamp,
-            "media metadata differs at record {index}: expected {expected:?}, got {actual:?}"
+            "media metadata differs at record {index}: expected {:?}/{:?}/{:?} ({} bytes), got {:?}/{:?}/{:?} ({} bytes)",
+            expected.stream,
+            expected.sequence,
+            expected.timestamp,
+            expected.payload.len(),
+            actual.stream,
+            actual.sequence,
+            actual.timestamp,
+            actual.payload.len()
         );
         if expected.payload != actual.payload {
             let expected_hash = hex::encode(Sha256::digest(&expected.payload));
@@ -354,22 +362,12 @@ pub fn write_media_trace(directory: &Path, observations: &[MediaObservation]) ->
     let mut total = 0usize;
     let mut records = Vec::with_capacity(observations.len());
     for (index, observation) in observations.iter().enumerate() {
-        ensure!(
-            observation.ordinal == index,
-            "media trace ordinal {} is not canonical index {index}",
-            observation.ordinal
-        );
-        ensure!(
-            observation.payload.len() <= MAX_MEDIA_PAYLOAD_BYTES as usize,
-            "media trace record {index} exceeds {MAX_MEDIA_PAYLOAD_BYTES} bytes"
-        );
-        total = total
-            .checked_add(observation.payload.len())
-            .context("media trace size overflow")?;
-        ensure!(
-            total <= MAX_MEDIA_TOTAL_BYTES,
-            "media trace exceeds {MAX_MEDIA_TOTAL_BYTES} bytes"
-        );
+        validate_record(
+            index,
+            observation.ordinal,
+            observation.payload.len(),
+            &mut total,
+        )?;
         persist_bytes(
             directory,
             &trace_payload_path(directory, index),
@@ -385,15 +383,17 @@ pub fn write_media_trace(directory: &Path, observations: &[MediaObservation]) ->
             sha256: hex::encode(Sha256::digest(&observation.payload)),
         });
     }
+    let expected_paths: BTreeSet<_> = records
+        .iter()
+        .map(|record| trace_payload_path(directory, record.ordinal))
+        .collect();
     for entry in std::fs::read_dir(directory)? {
         let path = entry?.path();
         if path
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.starts_with("record-") && name.ends_with(".bin"))
-            && !records
-                .iter()
-                .any(|record| trace_payload_path(directory, record.ordinal) == path)
+            && !expected_paths.contains(&path)
         {
             std::fs::remove_file(path)?;
         }
@@ -433,22 +433,7 @@ pub fn read_media_trace(directory: &Path) -> Result<Vec<MediaObservation>> {
     let mut total = 0usize;
     let mut observations = Vec::with_capacity(manifest.records.len());
     for (index, record) in manifest.records.into_iter().enumerate() {
-        ensure!(
-            record.ordinal == index,
-            "media trace ordinal {} is not canonical index {index}",
-            record.ordinal
-        );
-        ensure!(
-            record.bytes <= MAX_MEDIA_PAYLOAD_BYTES as usize,
-            "media trace record {index} exceeds {MAX_MEDIA_PAYLOAD_BYTES} bytes"
-        );
-        total = total
-            .checked_add(record.bytes)
-            .context("media trace size overflow")?;
-        ensure!(
-            total <= MAX_MEDIA_TOTAL_BYTES,
-            "media trace exceeds {MAX_MEDIA_TOTAL_BYTES} bytes"
-        );
+        validate_record(index, record.ordinal, record.bytes, &mut total)?;
         let path = trace_payload_path(directory, index);
         let payload_metadata = std::fs::symlink_metadata(&path)?;
         ensure!(
@@ -490,5 +475,28 @@ fn persist_bytes(directory: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
     temporary
         .persist(path)
         .with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+fn validate_record(index: usize, ordinal: usize, bytes: usize, total: &mut usize) -> Result<()> {
+    ensure!(
+        index < MAX_MEDIA_RECORDS,
+        "media trace exceeds {MAX_MEDIA_RECORDS} records"
+    );
+    ensure!(
+        ordinal == index,
+        "media trace ordinal {ordinal} is not canonical index {index}"
+    );
+    ensure!(
+        bytes <= MAX_MEDIA_PAYLOAD_BYTES as usize,
+        "media trace record {index} exceeds {MAX_MEDIA_PAYLOAD_BYTES} bytes"
+    );
+    *total = total
+        .checked_add(bytes)
+        .context("media trace size overflow")?;
+    ensure!(
+        *total <= MAX_MEDIA_TOTAL_BYTES,
+        "media trace exceeds {MAX_MEDIA_TOTAL_BYTES} bytes"
+    );
     Ok(())
 }

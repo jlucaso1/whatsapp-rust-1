@@ -147,3 +147,22 @@ fn persisted_traces_are_content_addressed_and_sweep_stale_payloads() {
     std::fs::write(directory.path().join("record-0000.bin"), b"tampered").unwrap();
     assert!(read_media_trace(directory.path()).is_err());
 }
+
+#[test]
+fn metadata_diagnostics_do_not_dump_payloads() {
+    let expected = MediaObservation {
+        stream: MediaStream::Audio,
+        symbol: "audio".into(),
+        ordinal: 0,
+        sequence: Some(1),
+        timestamp: Some(960),
+        payload: vec![0xab; 16_384],
+    };
+    let mut actual = expected.clone();
+    actual.timestamp = Some(1920);
+    let error = compare_media(&[expected], &[actual])
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("960") && error.contains("1920"));
+    assert!(error.len() < 512, "metadata errors must stay bounded");
+}
