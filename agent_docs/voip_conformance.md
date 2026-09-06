@@ -63,3 +63,8 @@ Rust regression coverage. They do not execute every IQ against WhatsApp Web.
 Full audio/video callback traces and end-to-end signaling/IQ differential
 cases remain separate evidence to derive. Until those cases exist and pass,
 this command reports the implemented gates, not complete VoIP equivalence.
+
+Expanded derivation specs are generated from committed bases/recipes into
+`.derive-mlow/specs/`, verified against `mlow.lock.json`, and uploaded alongside
+run manifests. The lightweight `cargo xt` dispatcher launches the release
+`whatsapp-oracle-task` worker; neither is linked into the application runtime.

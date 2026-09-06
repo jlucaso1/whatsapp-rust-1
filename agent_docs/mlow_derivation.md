@@ -552,3 +552,18 @@ Todos esses componentes são membros de tooling fora de `default-members`; o
 grafo de `whatsapp-rust` e `wacore` não contém Wasmtime, unwasm ou wa-store.
 O workflow MLOW executa o oráculo diretamente, sem checkout ou subprocesso de
 outro repositório.
+
+## Representação das specs e tarefas
+
+As bases e `tools/oracle-task/src/mlow-recipes.json` são versionadas; as oito
+expansões de traces e de S são geradas em `.derive-mlow/specs/` por
+`cargo xt mlow specs`, e automaticamente por `verify`/`regenerate`. Os SHA-256
+anteriores continuam em `mlow.lock.json`: a troca de representação não muda os
+programas, inputs, resoluções ou outputs. `cargo xt mlow specs --check` verifica
+as receitas contra esses hashes sem depender de cópias expandidas no Git.
+A CI publica as expansões junto dos manifestos como evidência revisável.
+
+O dispatcher `tools/xtask` não depende de Wasmtime. Os comandos MLOW/oracle
+acionam `tools/oracle-task` em release; hashes, descritores e tarefas CI seguem
+leves. Modos de verificação incompatíveis são recusados na CLI e representados
+internamente por `VerifyMode`.

@@ -33,6 +33,7 @@ members = [
     "tools/oracle-cli",
     "tools/oracle-core",
     "tools/xtask",
+    "tools/oracle-task",
     "tools/xtask-support",
     "transports/tokio-transport",
     "wacore",

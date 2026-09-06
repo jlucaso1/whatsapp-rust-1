@@ -1,9 +1,6 @@
 //! Rust repository automation: `cargo xt`.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 mod ci;
-mod derive_mlow;
-mod mlow;
-mod oracle_patch;
 mod size;
 mod workflow;
 use anyhow::Result;
@@ -34,15 +31,17 @@ enum Task {
     TablesDesc,
     /// Regenerate the SQLite wire descriptor and hashes.
     WireDesc,
-    /// Codec oracle regeneration and fixture packaging.
+    /// Codec oracle regeneration and fixture packaging (release worker).
+    #[command(disable_help_flag = true)]
     Mlow {
-        #[command(subcommand)]
-        task: mlow::Task,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<std::ffi::OsString>,
     },
-    /// WhatsApp wasm capture acquisition and diagnostic patching.
+    /// Capture acquisition, diagnostics, media and conformance (release worker).
+    #[command(disable_help_flag = true)]
     Oracle {
-        #[command(subcommand)]
-        task: oracle_patch::Task,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<std::ffi::OsString>,
     },
     /// CI metadata, timed tests, image pins, binary measurements and reporting.
     Ci {
@@ -71,14 +70,8 @@ fn main() -> Result<std::process::ExitCode> {
             descriptor(&root, "storages/sqlite-storage/proto/wire", false)?;
             0
         }
-        Task::Mlow { task } => {
-            mlow::run(&root, task)?;
-            0
-        }
-        Task::Oracle { task } => {
-            oracle_patch::run(&root, task)?;
-            0
-        }
+        Task::Mlow { args } => worker(&root, "mlow", &args)?,
+        Task::Oracle { args } => worker(&root, "oracle", &args)?,
         Task::Ci { task } => ci::run(&root, task)?,
     };
     Ok(std::process::ExitCode::from(status))
@@ -89,4 +82,26 @@ fn descriptor(root: &Path, stem: &str, source_info: bool) -> Result<()> {
         &root.join(format!("{stem}.desc")),
         source_info,
     )
+}
+
+fn worker(root: &Path, task: &str, args: &[std::ffi::OsString]) -> Result<u8> {
+    let status =
+        std::process::Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+            .args([
+                "run",
+                "--quiet",
+                "--release",
+                "--locked",
+                "-p",
+                "whatsapp-oracle-task",
+                "--",
+                task,
+            ])
+            .args(args)
+            .current_dir(root)
+            .status()?;
+    Ok(status
+        .code()
+        .and_then(|code| u8::try_from(code).ok())
+        .unwrap_or(1))
 }

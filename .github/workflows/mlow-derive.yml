@@ -29,6 +29,8 @@ jobs:
           workspaces: . -> target
       - name: Test native task utilities
         run: cargo test --locked -p whatsapp-xtask -p xtask-support
+      - name: Test oracle task utilities
+        run: cargo test --release --locked -p whatsapp-oracle-task
       - name: Run complete VoIP conformance gate
         if: github.event_name != 'schedule'
         run: cargo xt oracle conformance
@@ -40,6 +42,7 @@ jobs:
         with:
           name: voip-conformance-evidence
           path: |
+            .derive-mlow/specs/*.json
             .derive-mlow/wasm/*.log
             .derive-mlow/wasm/*/manifest.json
           if-no-files-found: error

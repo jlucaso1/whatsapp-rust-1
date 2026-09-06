@@ -44,7 +44,7 @@ jobs:
       - name: Run cargo-deny
         run: cargo deny --locked --all-features check
       - name: Audit host tooling dependencies
-        run: cargo deny --locked --manifest-path tools/xtask/Cargo.toml --all-features check
+        run: cargo deny --locked --manifest-path tools/oracle-task/Cargo.toml --all-features check
 
   semver-checks:
     name: Semver Checks (informational)

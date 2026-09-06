@@ -14,7 +14,8 @@ Ground truth for protocol behavior is WhatsApp Web itself: query the structured 
 ## Repository tasks
 
 Use `cargo xt --help` for descriptors, MLOW oracles and CI maintenance.
-First-party task logic is Rust under `tools/xtask`, outside default-members;
+The lightweight dispatcher and CI tasks live in `tools/xtask`; capture-backed
+tasks run in release through `tools/oracle-task`. Both stay outside default-members;
 `xtask-support` is local and shared with whatspec-codegen. The WhatsApp wasm
 host/specs live under `tools/oracle-*`; they use commit-pinned `unwasm-core`
 for static analysis and whatspec `wa-store` for capture transport. These tool

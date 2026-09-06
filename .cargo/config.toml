@@ -1,5 +1,5 @@
 [alias]
-xt = "run --quiet --release -p whatsapp-xtask --"
+xt = "run --quiet -p whatsapp-xtask --"
 
 # Workspace build configuration. Applies to builds of THIS repo only —
 # crates.io consumers are unaffected (cargo does not inherit this file

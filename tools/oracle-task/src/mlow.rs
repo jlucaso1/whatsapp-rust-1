@@ -1,4 +1,5 @@
 //! MLOW oracle derivation, lossless fixtures and independent C comparison.
+use super::derive_mlow::VerifyMode;
 use anyhow::{Context, Result, ensure};
 use clap::Subcommand;
 use serde_json::{Value, json};
@@ -25,7 +26,7 @@ pub enum Task {
         capture: String,
         #[arg(long)]
         out: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["update_lock", "refresh_spec_hashes"])]
         from_derived: bool,
         #[arg(long, conflicts_with = "refresh_spec_hashes")]
         update_lock: bool,
@@ -270,7 +271,16 @@ fn regenerate(root: &Path, out: &Path, cached: bool, check: bool) -> Result<()> 
             == std::fs::read(root.join(DATA).join("synth_mic.raw"))?,
         "synthetic input mismatch"
     );
-    super::derive_mlow::verify(root, out, "all", cached, false, false)?;
+    super::derive_mlow::verify(
+        root,
+        out,
+        "all",
+        if cached {
+            VerifyMode::Cached
+        } else {
+            VerifyMode::Execute
+        },
+    )?;
     let mut metadata = json!({});
     let data = root.join(DATA);
     for leaf in [
@@ -476,15 +486,19 @@ pub fn run(root: &Path, task: Task) -> Result<()> {
             root,
             &std::path::absolute(out.unwrap_or(root.join(".derive-mlow/wasm")))?,
             &capture,
-            from_derived,
-            update_lock,
-            refresh_spec_hashes,
+            if from_derived {
+                VerifyMode::Cached
+            } else if update_lock {
+                VerifyMode::UpdateLock
+            } else if refresh_spec_hashes {
+                VerifyMode::RefreshSpecHashes
+            } else {
+                VerifyMode::Execute
+            },
         ),
-        Task::Specs { out, check } => super::derive_mlow::specs(
-            root,
-            &out.unwrap_or(root.join("tools/oracle-core/specs")),
-            check,
-        ),
+        Task::Specs { out, check } => {
+            super::derive_mlow::specs(root, &out.unwrap_or(root.join(".derive-mlow/specs")), check)
+        }
         Task::Spec {
             kind,
             out,

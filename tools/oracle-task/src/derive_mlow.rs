@@ -1,7 +1,9 @@
 //! Native MLOW specification generation, snapshot assembly and pinned verification.
 mod assemble;
 use anyhow::{Context, Result, ensure};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use xtask_support::{output_tree, read_json, sha256, write_json};
 
@@ -23,30 +25,76 @@ fn specs_dir(root: &Path) -> PathBuf {
     root.join("tools/oracle-core/specs")
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TraceRecipe {
+    comment: Vec<String>,
+    functions: BTreeMap<String, IndexSelector>,
+    captures: Vec<Capture>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct IndexSelector {
+    index_hint: u32,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CaptureOp {
+    CaptureMemory,
+    CaptureValue,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Capture {
+    op: CaptureOp,
+    func: String,
+    instruction: usize,
+    local: u32,
+    count: usize,
+    out: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    at: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    len: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    float: Option<bool>,
+}
+
 fn trace(root: &Path, kind: &str, count: usize, end: usize) -> Result<Value> {
-    let catalog: Value = serde_json::from_str(include_str!("mlow-recipes.json"))?;
-    let recipe = catalog.get(kind).context("unknown MLOW trace kind")?;
+    let mut catalog: BTreeMap<String, TraceRecipe> =
+        serde_json::from_str(include_str!("mlow-recipes.json"))?;
+    let mut recipe = catalog.remove(kind).context("unknown MLOW trace kind")?;
     let mut base = read_json(&specs_dir(root).join("mlow_110frames.json"))?;
-    base["comment"] = recipe["comment"].clone();
-    base["functions"]
+    base["comment"] = json!(recipe.comment);
+    let functions = base["functions"]
         .as_object_mut()
-        .context("functions")?
-        .extend(
-            recipe["functions"]
-                .as_object()
-                .context("recipe functions")?
-                .clone(),
-        );
-    let mut captures = recipe["captures"].as_array().context("captures")?.clone();
-    for step in &mut captures {
-        if step["func"] == "lsf_core" {
-            step["count"] = json!(count);
-            if step["instruction"] != 0 {
-                step["instruction"] = json!(end);
+        .context("base functions")?;
+    for (name, selector) in recipe.functions {
+        functions.insert(name, serde_json::to_value(selector)?);
+    }
+    for capture in &mut recipe.captures {
+        if capture.func == "lsf_core" {
+            capture.count = count;
+            if capture.instruction != 0 {
+                capture.instruction = end;
             }
         }
     }
-    captures.extend(base["steps"].as_array().context("steps")?.iter().cloned());
+    let mut captures = recipe
+        .captures
+        .into_iter()
+        .map(serde_json::to_value)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    captures.extend(
+        base["steps"]
+            .as_array()
+            .context("base steps")?
+            .iter()
+            .cloned(),
+    );
     base["steps"] = json!(captures);
     Ok(base)
 }
@@ -97,19 +145,39 @@ fn generated_specs(root: &Path) -> Result<Vec<(String, Value)>> {
     }
     Ok(generated)
 }
+fn spec_bytes(value: &Value) -> Result<Vec<u8>> {
+    // Preserve the locked JSON representation, including optional fields/comments.
+    // Parsing the executable schema also rejects invalid recipe-generated programs.
+    let _: oracle_core::derive::Spec = serde_json::from_value(value.clone())?;
+    let mut bytes = serde_json::to_vec_pretty(value)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
 pub(crate) fn specs(root: &Path, out: &Path, check: bool) -> Result<()> {
+    let lock = read_json(&specs_dir(root).join("mlow.lock.json"))?;
     for (name, value) in generated_specs(root)? {
-        if check {
-            ensure!(
-                read_json(&specs_dir(root).join(&name))? == value,
-                "generated spec drift: {name}"
-            );
-        } else {
-            write_json(&out.join(name), &value)?;
+        let bytes = spec_bytes(&value)?;
+        let run = name.trim_end_matches(".json");
+        ensure!(
+            lock["runs"][run]["spec_sha256"].as_str() == Some(sha256(&bytes).as_str()),
+            "generated spec differs from locked expansion: {name}"
+        );
+        if !check {
+            xtask_support::write(&out.join(name), &bytes)?;
         }
     }
     Ok(())
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VerifyMode {
+    Execute,
+    Cached,
+    UpdateLock,
+    RefreshSpecHashes,
+}
+
 pub(crate) fn fetch(root: &Path, captures: Option<&[&str]>) -> Result<()> {
     let lock = read_json(&root.join("tools/oracle-core/wasm.lock.json"))?;
     let wanted = lock["modules"]
@@ -131,24 +199,22 @@ pub(crate) fn fetch(root: &Path, captures: Option<&[&str]>) -> Result<()> {
     wa_store::capture::restore_captures(&wanted, &sources, &root.join(".cache/wa-wasm"))
 }
 
-pub(crate) fn verify(
-    root: &Path,
-    out: &Path,
-    capture: &str,
-    cached: bool,
-    update: bool,
-    refresh: bool,
-) -> Result<()> {
+pub(crate) fn verify(root: &Path, out: &Path, capture: &str, mode: VerifyMode) -> Result<()> {
+    let cached = mode == VerifyMode::Cached;
+    let update = mode == VerifyMode::UpdateLock;
+    let refresh = mode == VerifyMode::RefreshSpecHashes;
     ensure!(
         !(update || refresh) || capture == "all",
         "lock refresh requires both captures"
     );
-    ensure!(
-        !cached || !(update || refresh),
-        "cached outputs cannot refresh a lock"
-    );
     let specs_root = specs_dir(root);
-    specs(root, &specs_root, true)?;
+    let expanded_root = root.join(".derive-mlow/specs");
+    if !update && !refresh {
+        specs(root, &expanded_root, true)?;
+    }
+    for (name, value) in generated_specs(root)? {
+        xtask_support::write(&expanded_root.join(name), &spec_bytes(&value)?)?;
+    }
     let expected = read_json(&specs_root.join("mlow.lock.json"))?;
     let inputs = json!({"synth_mic.raw":sha256(&std::fs::read(specs_root.join("synth_mic.raw"))?),"synth120_head.raw":sha256(&std::fs::read(specs_root.join("synth120_head.raw"))?)});
     if !update {
@@ -170,8 +236,14 @@ pub(crate) fn verify(
         for id in captures {
             for name in if id == J { J_RUNS } else { S_RUNS } {
                 let run = out.join(name);
+                let expanded = expanded_root.join(format!("{name}.json"));
+                let spec_path = if S_RUNS.contains(name) || name.ends_with("_trace") {
+                    expanded
+                } else {
+                    specs_root.join(format!("{name}.json"))
+                };
                 if !update && !refresh {
-                    let source = std::fs::read(specs_root.join(format!("{name}.json")))?;
+                    let source = std::fs::read(&spec_path)?;
                     ensure!(
                         expected["runs"][name]["spec_sha256"].as_str()
                             == Some(sha256(&source).as_str()),
@@ -180,7 +252,7 @@ pub(crate) fn verify(
                 }
                 if !cached {
                     oracle_core::derive::run_spec(
-                        &specs_root.join(format!("{name}.json")),
+                        &spec_path,
                         &root.join(format!(".cache/wa-wasm/{id}.wasm")),
                         &run,
                     )?;
@@ -233,5 +305,15 @@ pub(crate) fn assemble(
         )
     } else {
         assemble::all(&std::path::absolute(out)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn recipes_reproduce_every_locked_expansion() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        specs(&root, &root.join(".derive-mlow/specs"), true).unwrap();
     }
 }
