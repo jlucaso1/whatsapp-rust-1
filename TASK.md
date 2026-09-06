@@ -198,3 +198,18 @@ execução; nenhum índice ou layout foi presumido nesta etapa.
   atribuir ao wasm comportamentos de IQ que pertencem ao bundle JS.
 - [x] Captura ausente/corrompida e probes inconclusivos agora falham em todos os
   testes do oráculo em vez de virarem skips silenciosos.
+
+## Retomada após CI remoto
+
+WhatSpec #49 e Unwasm #4 foram mesclados. O head `041bfdc4d` do consumidor
+passou os checks de build, testes, Miri, wasm32, rustdoc, supply-chain e
+rederivação; semver permanece informativo. Três novos findings estão sendo
+validados: contadores de stubs após saturação do trace, ranges WASI de PRNG
+antes de consumir entropia e recusa de expressões compostas de offset.
+
+As três correções passaram em release (26 testes de biblioteca, 21 de host),
+clippy de todos os alvos do oráculo e rustdoc com warnings negados. A descrição
+da PR e `voip_conformance.md` agora distinguem o gate normal aprovado dos
+26 cenários lentos de signaling não executados e dos adaptadores E2E ainda
+por derivar. Reexecução da base CodSpeed solicitada em 33994586496 para
+eliminar a comparação entre configurações diferentes de estimativa de ciclos.

@@ -835,26 +835,17 @@ impl Runtime {
     /// The list to work through when behaviour is wrong in a way that points
     /// nowhere: each entry is a call the host answered with a zero it made up.
     /// A stub nobody calls is fine and is not listed.
-    pub fn stubs_called(&self) -> Vec<(String, usize)> {
+    pub fn stubs_called(&self) -> Vec<(String, u64)> {
         let shared = &self.store.data().shared;
         let Some(stubbed) = shared.stubbed.get() else {
             return Vec::new();
         };
 
-        let mut counts: std::collections::BTreeMap<String, usize> =
-            std::collections::BTreeMap::new();
-        for call in shared.calls() {
-            let symbol = format!("{}::{}", call.module, call.name);
-            if stubbed.contains(&symbol) {
-                *counts.entry(symbol).or_default() += 1;
-            }
-        }
-
-        let mut out: Vec<(String, usize)> = counts.into_iter().collect();
-        // Most-called first: the hot ones are where a made-up answer does the
-        // most damage.
-        out.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
-        out
+        shared
+            .hot_calls()
+            .into_iter()
+            .filter(|(symbol, _)| stubbed.contains(symbol))
+            .collect()
     }
 
     /// Recorded host calls with this symbol, from any thread — **the first
@@ -1380,5 +1371,29 @@ impl Runtime {
     /// `engine_log_overflowed`.
     pub fn engine_log_from(&self, mark: usize) -> Vec<String> {
         self.engine_log().into_iter().skip(mark).collect()
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn late_stubs_are_counted_after_the_argument_trace_fills() {
+        let mut types = wasm_encoder::TypeSection::new();
+        types.ty().function([], []);
+        let mut imports = wasm_encoder::ImportSection::new();
+        imports.import("env", "late", wasm_encoder::EntityType::Function(0));
+        let mut module = wasm_encoder::Module::new();
+        module.section(&types);
+        module.section(&imports);
+        let runtime = Runtime::instantiate(&module.finish()).unwrap();
+        let shared = runtime.shared();
+        for _ in 0..8192 {
+            shared.record("env", "early", Vec::new());
+        }
+        shared.record("env", "late", Vec::new());
+        shared.record("env", "late", Vec::new());
+        assert_eq!(runtime.stubs_called(), [("env::late".to_owned(), 2)]);
     }
 }

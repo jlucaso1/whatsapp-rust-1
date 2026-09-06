@@ -670,6 +670,9 @@ fn dispatch(name: &str, caller: &mut Caller<'_, HostState>, params: &[Val]) -> i
         "clock_time_get" => clock_time_get(caller, arg(params, 0), arg(params, 2)),
         "random_get" => {
             let (ptr, len) = (arg(params, 0), arg(params, 1));
+            if len > 16 * 1024 * 1024 || caller.data().ensure_memory_range(ptr, len).is_err() {
+                return EINVAL;
+            }
             let mut bytes = Vec::with_capacity(len as usize);
             {
                 let state = caller.data();

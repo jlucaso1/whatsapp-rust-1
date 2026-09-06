@@ -48,3 +48,18 @@ execution, and `wacore` owns the implementation being checked.
 
 Media-specific trace layout and audio/video scenarios are in
 [`voip_media_oracle.md`](voip_media_oracle.md).
+
+## Verified coverage and remaining evidence
+
+[CI run 33999004005](https://github.com/oxidezap/whatsapp-rust/actions/runs/33999004005)
+verified the normal gate on `041bfdc4d`: all 11 J/S derivations, 680 VoIP tests
+and 334 IQ tests passed. The signaling test binary reported 26 ignored tests;
+this run does not validate those slow call scenarios. Their assertions still
+include capture-specific investigation cases documented in the oracle's
+`AGENTS.md`; scheduling them is not proof they pass.
+
+The IQ tests and generated-artifact check establish schema consistency and
+Rust regression coverage. They do not execute every IQ against WhatsApp Web.
+Full audio/video callback traces and end-to-end signaling/IQ differential
+cases remain separate evidence to derive. Until those cases exist and pass,
+this command reports the implemented gates, not complete VoIP equivalence.

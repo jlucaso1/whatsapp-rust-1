@@ -1114,3 +1114,57 @@ fn a_proxied_call_can_return_something_other_than_an_i32() {
         other => panic!("expected an f64, got {other:?}"),
     }
 }
+
+#[test]
+fn wasi_random_rejection_preserves_memory_and_rng() {
+    use wasm_encoder::{
+        EntityType, ExportKind, ExportSection, ImportSection, MemorySection, MemoryType, Module,
+        TypeSection, ValType,
+    };
+    let mut types = TypeSection::new();
+    types
+        .ty()
+        .function([ValType::I32, ValType::I32], [ValType::I32]);
+    let mut imports = ImportSection::new();
+    imports.import(
+        "wasi_snapshot_preview1",
+        "random_get",
+        EntityType::Function(0),
+    );
+    let mut memories = MemorySection::new();
+    memories.memory(MemoryType {
+        minimum: 1,
+        maximum: None,
+        memory64: false,
+        shared: false,
+        page_size_log2: None,
+    });
+    let mut exports = ExportSection::new();
+    exports.export("memory", ExportKind::Memory, 0);
+    exports.export("random", ExportKind::Func, 0);
+    let mut module = Module::new();
+    module.section(&types);
+    module.section(&imports);
+    module.section(&memories);
+    module.section(&exports);
+    let bytes = module.finish();
+    let mut baseline = Runtime::instantiate(&bytes).unwrap();
+    let mut tested = Runtime::instantiate(&bytes).unwrap();
+    for (ptr, len) in [(0, -1), (65_520, 32)] {
+        let result = tested
+            .call(
+                "random",
+                &[wasmtime::Val::I32(ptr), wasmtime::Val::I32(len)],
+            )
+            .unwrap();
+        assert_eq!(errno_of(&result), 28);
+    }
+    assert_eq!(tested.read(0, 32).unwrap(), vec![0; 32]);
+    for runtime in [&mut baseline, &mut tested] {
+        let result = runtime
+            .call("random", &[wasmtime::Val::I32(0), wasmtime::Val::I32(32)])
+            .unwrap();
+        assert_eq!(errno_of(&result), 0);
+    }
+    assert_eq!(tested.read(0, 32).unwrap(), baseline.read(0, 32).unwrap());
+}

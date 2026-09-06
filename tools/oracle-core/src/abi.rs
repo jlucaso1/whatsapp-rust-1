@@ -257,10 +257,10 @@ impl Origin {
 /// The constant offset an active element segment starts at.
 fn const_offset(expr: &wasmparser::ConstExpr<'_>) -> Option<u32> {
     let mut reader = expr.get_operators_reader();
-    match reader.read().ok()? {
-        Operator::I32Const { value } => Some(value as u32),
-        _ => None,
-    }
+    let Operator::I32Const { value } = reader.read().ok()? else {
+        return None;
+    };
+    (matches!(reader.read().ok()?, Operator::End) && reader.eof()).then_some(value as u32)
 }
 
 /// Infers the ABI of the function a table slot points at.
@@ -1406,4 +1406,22 @@ pub fn find_constant_users(bytes: &[u8], value: i32) -> Result<Vec<(u32, usize)>
     }
 
     Ok(found)
+}
+
+#[cfg(test)]
+mod offset_tests {
+    use super::*;
+
+    #[test]
+    fn compound_offsets_are_not_mistaken_for_the_first_operand() {
+        let offset = |bytes: &[u8]| {
+            const_offset(&wasmparser::ConstExpr::new(wasmparser::BinaryReader::new(
+                bytes, 0,
+            )))
+        };
+        assert_eq!(offset(&[0x41, 3, 0x0b]), Some(3));
+        assert_eq!(offset(&[0x41, 3, 0x41, 4, 0x6a, 0x0b]), None);
+        assert_eq!(offset(&[0x41, 3]), None);
+        assert_eq!(offset(&[0x41, 3, 0x0b, 0x41, 4]), None);
+    }
 }
