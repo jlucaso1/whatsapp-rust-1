@@ -333,6 +333,14 @@ pub(crate) fn commit_barrier_error(error: StoreError) -> StoreError {
     StoreError::Database(Box::new(CommitBarrierError(error)))
 }
 
+#[inline(never)]
+pub(crate) async fn await_barrier_hook(hook: &Option<CommitBarrierHook>) -> Result<()> {
+    if let Some(barrier) = hook {
+        barrier().await.map_err(commit_barrier_error)?;
+    }
+    Ok(())
+}
+
 #[cfg(not(target_family = "wasm"))]
 pub type CommitBarrierHook = Arc<dyn Fn() -> CommitBarrierFuture + Send + Sync + 'static>;
 
@@ -822,7 +830,7 @@ impl SqliteStore {
         .await
         .map_err(|e| StoreError::Database(Box::new(e)))??;
         if let Some(barrier) = commit_barrier {
-            barrier().await.map_err(commit_barrier_error)?;
+            await_barrier_hook(&Some(barrier)).await?;
         }
 
         // Reader connections only pay off under WAL, and only with a page cache
@@ -1059,10 +1067,7 @@ impl SqliteStore {
     }
 
     async fn await_commit_barrier(&self) -> Result<()> {
-        if let Some(barrier) = &self.commit_barrier {
-            barrier().await.map_err(commit_barrier_error)?;
-        }
-        Ok(())
+        await_barrier_hook(&self.commit_barrier).await
     }
 
     /// Execute a database operation with semaphore serialization and retry on

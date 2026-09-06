@@ -9,7 +9,7 @@ use diesel::sqlite::SqliteConnection;
 use std::sync::Arc;
 use wacore::store::error::{Result, StoreError};
 
-use crate::sqlite_store::{CommitBarrierHook, SqlitePool, SqliteStore, commit_barrier_error};
+use crate::sqlite_store::{CommitBarrierHook, SqlitePool, SqliteStore, await_barrier_hook};
 
 /// Clonable handle onto a [`SqliteStore`]'s connection pool and serialization
 /// semaphore. Obtained via [`SqliteStore::shared`]. Holding one does not keep any
@@ -105,9 +105,7 @@ impl SharedSqlite {
         .await
         .map_err(|e| StoreError::Database(Box::new(e)))??;
         let (result, permit) = result;
-        if let Some(barrier) = commit_barrier {
-            barrier().await.map_err(commit_barrier_error)?;
-        }
+        await_barrier_hook(&commit_barrier).await?;
         drop(permit);
         Ok(result)
     }
