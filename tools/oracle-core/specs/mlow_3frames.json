@@ -19,10 +19,12 @@
       "must_hold_string": "pj_init"
     },
     "log_mutex_init": {
-      "index_hint": 9848
+      "index_hint": 9848,
+      "expect_body_sha256": "cb1f388ffeabe98d04e619a89c11031eacd2d6956abe7b70bb8fcad2b22abda7"
     },
     "smpl_init": {
-      "index_hint": 10566
+      "index_hint": 10566,
+      "expect_body_sha256": "5752a7b38afe7f2130cfbce64d33a0dfcac9451a254f880f6b0e0b9c62b0d412"
     },
     "opus_open": {
       "index_hint": 6658,

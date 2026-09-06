@@ -326,21 +326,31 @@ fn parse(bytes: &[u8]) -> Result<Parsed> {
                         }
                         // `memories` and `tables` are already in index-space
                         // order, so the export's own index is the lookup.
-                        wasmparser::ExternalKind::Memory => match memories.get(index) {
-                            Some((min, max, shared)) => EntryKind::Memory {
+                        wasmparser::ExternalKind::Memory => {
+                            let (min, max, shared) = memories.get(index).with_context(|| {
+                                format!(
+                                    "memory export {:?} references missing memory index {index}",
+                                    export.name
+                                )
+                            })?;
+                            EntryKind::Memory {
                                 min: *min,
                                 max: *max,
                                 shared: *shared,
-                            },
-                            None => EntryKind::Global,
-                        },
-                        wasmparser::ExternalKind::Table => match tables.get(index) {
-                            Some((min, max)) => EntryKind::Table {
+                            }
+                        }
+                        wasmparser::ExternalKind::Table => {
+                            let (min, max) = tables.get(index).with_context(|| {
+                                format!(
+                                    "table export {:?} references missing table index {index}",
+                                    export.name
+                                )
+                            })?;
+                            EntryKind::Table {
                                 min: *min,
                                 max: *max,
-                            },
-                            None => EntryKind::Global,
-                        },
+                            }
+                        }
                         _ => EntryKind::Global,
                     };
                     out.exports.push(ExportEntry {
@@ -473,6 +483,17 @@ mod tests {
         EntityType, ExportKind, ExportSection, ImportSection, MemorySection, MemoryType, Module,
         RefType, TableSection, TableType,
     };
+
+    #[test]
+    fn missing_memory_and_table_exports_are_rejected() {
+        for kind in [ExportKind::Memory, ExportKind::Table] {
+            let mut exports = ExportSection::new();
+            exports.export("missing", kind, 0);
+            let mut module = Module::new();
+            module.section(&exports);
+            assert!(parse(&module.finish()).is_err());
+        }
+    }
 
     fn table_type(minimum: u64, maximum: Option<u64>) -> TableType {
         TableType {

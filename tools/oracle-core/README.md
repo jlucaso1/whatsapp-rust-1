@@ -552,3 +552,9 @@ logging explicitly.
 Derivation output paths reserve `manifest.json` and are validated before any
 step runs. Enum-table reads are limited to 65,536 entries and reject address
 overflow. WASI validates `nwritten` before changing streams, files or offsets.
+
+Selectors require a string anchor, fingerprint or `expect_body_sha256` for the
+exact encoded body. `oracle abi CAPTURE --index N --body-sha256` computes the
+latter for a reviewed function index; an index alone is rejected. Vector reads
+are capped at 65,536 elements and derivation fills at 64 MiB. WASI validates
+result pointers and all iovec ranges before changing buffers, files or offsets.

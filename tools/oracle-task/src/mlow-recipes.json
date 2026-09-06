@@ -5,7 +5,8 @@
     ],
     "functions": {
       "core_encode": {
-        "index_hint": 10736
+        "index_hint": 10736,
+        "expect_body_sha256": "60b2d1f87f901ec58bf0ca546befa38598fe6dfdc051463d7d908a2326bc6109"
       }
     },
     "captures": [
@@ -85,7 +86,8 @@
     ],
     "functions": {
       "core_encode": {
-        "index_hint": 10736
+        "index_hint": 10736,
+        "expect_body_sha256": "60b2d1f87f901ec58bf0ca546befa38598fe6dfdc051463d7d908a2326bc6109"
       }
     },
     "captures": [
@@ -187,10 +189,12 @@
     ],
     "functions": {
       "core_encode": {
-        "index_hint": 10736
+        "index_hint": 10736,
+        "expect_body_sha256": "60b2d1f87f901ec58bf0ca546befa38598fe6dfdc051463d7d908a2326bc6109"
       },
       "lsf_core": {
-        "index_hint": 10804
+        "index_hint": 10804,
+        "expect_body_sha256": "1ef81d8df9e1e437283901331033dee945ff0871a30233536f94d7c8e33d51a6"
       }
     },
     "captures": [
@@ -390,7 +394,8 @@
     ],
     "functions": {
       "core_decode": {
-        "index_hint": 10726
+        "index_hint": 10726,
+        "expect_body_sha256": "ac9633af6f8463abe22c9acff199d0683aca40750ef09025f6ea3e06db87425b"
       }
     },
     "captures": [
@@ -537,7 +542,8 @@
     ],
     "functions": {
       "decode_params": {
-        "index_hint": 10758
+        "index_hint": 10758,
+        "expect_body_sha256": "04bf56c111c36c857a5c97672b0c7377442a70eef27576bf840b56f4bf55fa5d"
       }
     },
     "captures": [
@@ -617,7 +623,8 @@
     ],
     "functions": {
       "core_decode": {
-        "index_hint": 10726
+        "index_hint": 10726,
+        "expect_body_sha256": "ac9633af6f8463abe22c9acff199d0683aca40750ef09025f6ea3e06db87425b"
       }
     },
     "captures": [

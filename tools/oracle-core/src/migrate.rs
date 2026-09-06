@@ -143,6 +143,10 @@ pub fn migrate_spec(
                 .context("selector vanished mid-migration")?;
             entry.index_hint = *new_index;
             entry.expect_fingerprint = crate::derive::body_fingerprint(new_bytes, *new_index)?;
+            if entry.expect_body_sha256.is_some() {
+                entry.expect_body_sha256 =
+                    Some(crate::derive::function_body_sha256(new_bytes, *new_index)?);
+            }
         } else {
             // An old hint under the new module pin could call unrelated code.
             // Missing selectors are refused by derive before instantiation.
@@ -309,6 +313,7 @@ mod tests {
                 index_hint: 0,
                 must_hold_string: None,
                 expect_fingerprint: None,
+                expect_body_sha256: Some(crate::derive::function_body_sha256(&bytes, 0).unwrap()),
             },
         );
         let spec = Spec {
@@ -348,6 +353,7 @@ mod tests {
                 index_hint: 99,
                 must_hold_string: None,
                 expect_fingerprint: None,
+                expect_body_sha256: None,
             },
         );
         let spec = Spec {
@@ -410,6 +416,9 @@ mod tests {
                     index_hint: 0,
                     must_hold_string: None,
                     expect_fingerprint: None,
+                    expect_body_sha256: Some(
+                        crate::derive::function_body_sha256(&bytes, 0).unwrap(),
+                    ),
                 },
             )]),
             steps: vec![crate::derive::Step::CallFunction {

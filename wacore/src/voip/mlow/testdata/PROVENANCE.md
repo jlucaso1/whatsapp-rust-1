@@ -121,6 +121,9 @@ The existing C packet/PCM pairs (`inbound_capture_frames.json`, `ref_usesmpl_exp
 `mlow_120ms_frames.json`, `ref_120ms_expected.raw`, `mlow_dtx_off_frames.json`,
 `ref_dtx_off_expected.raw`) remain independent compatibility checks. The 120 ms/DTX-off C pairs
 can also be regenerated with `MLOW_REFERENCE=/path/to/opus_mlow cargo xt mlow c-reference`.
+The C reference must be a Git checkout at the pinned `84b076e` revision;
+unknown or different revisions are rejected before compiling or writing fixtures.
+`MLOW_ALLOW_DIRTY_REFERENCE=1` permits deliberate local edits only on that revision.
 Runtime seed tables are documented separately in [README.md](README.md).
 
 ## Verification

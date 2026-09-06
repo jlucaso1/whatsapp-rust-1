@@ -8,7 +8,7 @@ use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use wasmtime::{Caller, Extern, Memory, SharedMemory};
 
 use crate::embind::EmbindRegistry;
@@ -294,10 +294,8 @@ impl HostState {
                 ));
             }
             // Bounds are checked above; each byte is an independent relaxed
-            // atomic load, so a write racing this read yields old or new bytes
-            // rather than undefined behaviour. `forced_turns()` counts how often
-            // the scheduler let that window open, and the startup guard keeps it
-            // at zero.
+            // atomic load, so concurrent writes can produce a torn snapshot
+            // without a host data race. Scheduling does not guarantee coherence.
             return Ok(data[start..end].iter().map(load_shared).collect());
         }
 
@@ -352,10 +350,17 @@ impl HostState {
         if ptr == 0 {
             return Ok(String::new());
         }
-        let bytes = self.read(ptr, MAX).or_else(|_| {
-            // Near the end of memory a full-length read fails; retry smaller.
-            self.read(ptr, 256)
-        })?;
+        let size = if let Some(memory) = self.memory.as_ref() {
+            memory.data().len()
+        } else {
+            self.linear
+                .context("module memory is not available to the host")?
+                .1
+        };
+        let remaining = size
+            .checked_sub(ptr as usize)
+            .context("C string pointer is outside memory")?;
+        let bytes = self.read(ptr, remaining.min(MAX as usize) as u32)?;
         let end = bytes
             .iter()
             .position(|&byte| byte == 0)
@@ -478,5 +483,34 @@ impl HostState {
     /// Locks the process-wide WASI environment. Release before entering guest code.
     pub fn wasi(&self) -> std::sync::MutexGuard<'_, crate::wasi::WasiState> {
         self.shared.wasi.lock().expect("WASI state poisoned")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use wasm_encoder::{ExportKind, ExportSection, MemorySection, MemoryType, Module};
+    #[test]
+    fn c_strings_can_end_at_the_memory_boundary() {
+        let mut memories = MemorySection::new();
+        memories.memory(MemoryType {
+            minimum: 1,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+        let mut exports = ExportSection::new();
+        exports.export("memory", ExportKind::Memory, 0);
+        let mut module = Module::new();
+        module.section(&memories).section(&exports);
+        let mut runtime = crate::Runtime::instantiate(&module.finish()).unwrap();
+        runtime.write_bytes_at(65_533, b"ok\0").unwrap();
+        assert_eq!(runtime.state().read_cstr(65_533).unwrap(), "ok");
+        assert_eq!(runtime.state().read_cstr(65_535).unwrap(), "");
+        assert!(runtime.state().read_cstr(65_536).is_err());
+        runtime.write_bytes_at(65_535, b"x").unwrap();
+        assert!(runtime.state().read_cstr(65_535).is_err());
+        runtime.write_bytes_at(65_534, &[0xff, 0]).unwrap();
+        assert!(runtime.state().read_cstr(65_534).is_err());
     }
 }

@@ -37,6 +37,7 @@ struct TraceRecipe {
 #[serde(deny_unknown_fields)]
 struct IndexSelector {
     index_hint: u32,
+    expect_body_sha256: String,
 }
 
 #[derive(Deserialize, Serialize)]

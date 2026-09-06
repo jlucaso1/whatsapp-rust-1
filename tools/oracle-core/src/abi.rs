@@ -1142,6 +1142,10 @@ pub struct StringRef {
 ///
 /// Matching is by substring, so a partial message is enough.
 pub fn find_string_refs(bytes: &[u8], needle: &str) -> Result<Vec<StringRef>> {
+    anyhow::ensure!(
+        !needle.is_empty(),
+        "string-reference query must not be empty"
+    );
     let module = Layout::read(bytes)?;
 
     // Where each match sits, keyed by address so several hits in one segment
@@ -1424,6 +1428,11 @@ pub fn find_constant_users(bytes: &[u8], value: i32) -> Result<Vec<(u32, usize)>
 #[cfg(test)]
 mod offset_tests {
     use super::*;
+
+    #[test]
+    fn empty_string_queries_are_errors() {
+        assert!(find_string_refs(&crate::derive::probe_module_bytes(), "").is_err());
+    }
 
     #[test]
     fn enum_table_ranges_are_checked_before_reading() {

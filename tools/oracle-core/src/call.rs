@@ -565,7 +565,7 @@ impl Runtime {
         )?;
 
         match results.first() {
-            Some(Val::I32(len)) => Ok(*len as i64),
+            Some(Val::I32(len)) => checked_vector_len(i64::from(*len)),
             other => Err(anyhow!("size returned {other:?}")),
         }
     }
@@ -668,9 +668,26 @@ impl Runtime {
     }
 }
 
+fn checked_vector_len(len: i64) -> Result<i64> {
+    ensure!(
+        (0..=65_536).contains(&len),
+        "vector length {len} is outside the host limit 0..=65536"
+    );
+    Ok(len)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vector_lengths_must_be_nonnegative_and_bounded() {
+        for len in [-1, i64::MIN, 65_537, i64::MAX] {
+            assert!(checked_vector_len(len).is_err());
+        }
+        assert_eq!(checked_vector_len(0).unwrap(), 0);
+        assert_eq!(checked_vector_len(65_536).unwrap(), 65_536);
+    }
 
     #[test]
     fn unsigned_integer_wires_preserve_values_and_reject_overflow() {

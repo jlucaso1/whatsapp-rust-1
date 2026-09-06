@@ -36,7 +36,8 @@
       "expect_fingerprint": 8591841716802926967
     },
     "smpl_init": {
-      "index_hint": 10855
+      "index_hint": 10855,
+      "expect_body_sha256": "7833fa22ce34642f9b75baf17581efebb1376a33e4ffcb259d954ff02004253a"
     }
   },
   "steps": [

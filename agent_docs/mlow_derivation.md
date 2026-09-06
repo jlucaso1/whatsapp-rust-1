@@ -31,7 +31,7 @@ mode accepts cached outputs; CI uses neither.
 
 Bases and typed recipes in `tools/oracle-task/src/mlow-recipes.json` are tracked.
 `cargo xt mlow specs` generates eight trace/S expansions in `.derive-mlow/specs`;
-verification generates them automatically. Their original SHA-256s remain in
+verification generates them automatically. Their spec-byte SHA-256s are checked against
 `mlow.lock.json`, and CI uploads the expansions alongside run manifests.
 
 ## Ownership and invariants
@@ -46,6 +46,10 @@ verification generates them automatically. Their original SHA-256s remain in
   runtime graph. Fixture readers are test dependencies.
 - Derivation is single-threaded. Ambiguous selectors, invalid pointers, malformed
   hex, wrong status values and hash mismatches are errors, not fallback results.
+- Every selector needs a string anchor, fingerprint or exact body SHA-256.
+  Short trampolines use `expect_body_sha256`; get the hash for a reviewed index
+  with `oracle abi CAPTURE --index N --body-sha256`. Migration still refuses
+  short bodies it cannot independently map to the new capture.
 - `manifest.json` has no timestamps. Identical specs and modules must produce
   identical resolutions and outputs. Migration checks the old capture hash and
   removes unresolved selectors rather than retaining stale indices.
@@ -274,3 +278,8 @@ utility tests, four worker tests, all 11 J/S derivations, fixture checks,
 all-target clippy and rustdoc with warnings denied. The 26 slow signaling
 research scenarios remained ignored. Those broader coverage limits are recorded
 in [voip_conformance.md](voip_conformance.md).
+
+Selector hardening added exact body hashes from the existing locked resolutions.
+The guarded specs were rerun with `--refresh-spec-hashes`: all 11 runs retained
+identical module pins, resolutions and output trees. Only spec-byte hashes and
+the fixture manifest's derivation-lock reference changed.

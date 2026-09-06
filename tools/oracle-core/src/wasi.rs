@@ -115,13 +115,20 @@ fn normalise(path: &str) -> String {
 fn read_iovecs(state: &HostState, ptr: u32, count: u32) -> Result<Vec<(u32, u32)>> {
     const MAX: u32 = 1024;
     anyhow::ensure!(count <= MAX, "iovec count exceeds {MAX}");
+    let mut total = 0u32;
     (0..count)
         .map(|index| {
             let base = ptr
                 .checked_add(index.checked_mul(8).context("iovec offset overflow")?)
                 .context("iovec address overflow")?;
             let length_at = base.checked_add(4).context("iovec address overflow")?;
-            Ok((state.read_u32(base)?, state.read_u32(length_at)?))
+            let (ptr, len) = (state.read_u32(base)?, state.read_u32(length_at)?);
+            total = total
+                .checked_add(len)
+                .context("iovec payload size overflow")?;
+            anyhow::ensure!(total <= 256 * 1024 * 1024, "iovec payload exceeds 256 MiB");
+            state.ensure_memory_range(ptr, len)?;
+            Ok((ptr, len))
         })
         .collect()
 }
@@ -230,6 +237,12 @@ fn read_into(
     at: Option<u64>,
     out: u32,
 ) -> i32 {
+    if caller.data().ensure_memory_range(out, 4).is_err() {
+        return EINVAL;
+    }
+    let Ok(vectors) = read_iovecs(caller.data(), iovs, count) else {
+        return EINVAL;
+    };
     if fd == FD_STDIN {
         // Always at end of input; no interactive stdin exists here.
         return match write_u32(caller.data(), out, 0) {
@@ -238,9 +251,6 @@ fn read_into(
         };
     }
 
-    let Ok(vectors) = read_iovecs(caller.data(), iovs, count) else {
-        return EINVAL;
-    };
     let state = caller.data();
     let mut wasi = state.wasi();
     let Some(open) = wasi.open.get(&fd) else {
@@ -313,6 +323,9 @@ fn clock_time_get(caller: &mut Caller<'_, HostState>, id: u32, out: u32) -> i32 
 }
 
 fn fd_seek(caller: &mut Caller<'_, HostState>, fd: u32, delta: i64, whence: u32, out: u32) -> i32 {
+    if caller.data().ensure_memory_range(out, 8).is_err() {
+        return EINVAL;
+    }
     let state = caller.data();
     let mut wasi = state.wasi();
     let Some(open) = wasi.open.get(&fd) else {
@@ -360,7 +373,10 @@ fn path_open(
     const O_TRUNC: u32 = 8;
     const SUPPORTED: u32 = O_CREAT | O_TRUNC;
 
-    if oflags & !SUPPORTED != 0 || fdflags != 0 {
+    if oflags & !SUPPORTED != 0
+        || fdflags != 0
+        || caller.data().ensure_memory_range(out, 4).is_err()
+    {
         return EINVAL;
     }
 
@@ -702,6 +718,120 @@ fn dispatch(name: &str, caller: &mut Caller<'_, HostState>, params: &[Val]) -> i
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_result_pointers_do_not_mutate_reads_seeks_or_opens() {
+        use ValType::{I32, I64};
+        use wasm_encoder::{
+            CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection, Function,
+            FunctionSection, ImportSection, MemorySection, MemoryType, Module, TypeSection,
+            ValType,
+        };
+        let signatures: &[(&str, &[ValType])] = &[
+            ("fd_read", &[I32, I32, I32, I32]),
+            ("fd_pread", &[I32, I32, I32, I64, I32]),
+            ("fd_seek", &[I32, I64, I32, I32]),
+            ("path_open", &[I32, I32, I32, I32, I32, I64, I64, I32, I32]),
+        ];
+        let mut types = TypeSection::new();
+        let mut imports = ImportSection::new();
+        let mut functions = FunctionSection::new();
+        let mut exports = ExportSection::new();
+        let mut code = CodeSection::new();
+        for (index, (name, params)) in signatures.iter().enumerate() {
+            types.ty().function(params.iter().copied(), [I32]);
+            imports.import(
+                "wasi_snapshot_preview1",
+                name,
+                EntityType::Function(index as u32),
+            );
+            functions.function(index as u32);
+            exports.export(name, ExportKind::Func, (signatures.len() + index) as u32);
+            let mut body = Function::new([]);
+            for argument in 0..params.len() {
+                body.instructions().local_get(argument as u32);
+            }
+            body.instructions().call(index as u32).end();
+            code.function(&body);
+        }
+        let mut memories = MemorySection::new();
+        memories.memory(MemoryType {
+            minimum: 1,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+        exports.export("memory", ExportKind::Memory, 0);
+        let mut data = DataSection::new();
+        data.active(0, &ConstExpr::i32_const(0), [64, 0, 0, 0, 3, 0, 0, 0]);
+        data.active(0, &ConstExpr::i32_const(64), [0x55; 3]);
+        data.active(0, &ConstExpr::i32_const(128), b"out".iter().copied());
+        let mut module = Module::new();
+        module
+            .section(&types)
+            .section(&imports)
+            .section(&functions)
+            .section(&memories)
+            .section(&exports)
+            .section(&code)
+            .section(&data);
+        let bytes = module.finish();
+        let cases = [
+            (
+                "fd_read",
+                vec![Val::I32(4), Val::I32(0), Val::I32(1), Val::I32(-1)],
+            ),
+            (
+                "fd_pread",
+                vec![
+                    Val::I32(4),
+                    Val::I32(0),
+                    Val::I32(1),
+                    Val::I64(0),
+                    Val::I32(-1),
+                ],
+            ),
+            (
+                "fd_seek",
+                vec![Val::I32(4), Val::I64(0), Val::I32(0), Val::I32(-1)],
+            ),
+            (
+                "path_open",
+                vec![
+                    Val::I32(3),
+                    Val::I32(0),
+                    Val::I32(128),
+                    Val::I32(3),
+                    Val::I32(8),
+                    Val::I64(0),
+                    Val::I64(0),
+                    Val::I32(0),
+                    Val::I32(-1),
+                ],
+            ),
+        ];
+        for (name, params) in cases {
+            let mut runtime = crate::Runtime::instantiate(&bytes).unwrap();
+            runtime.add_file("out", vec![1, 2, 3, 4]);
+            runtime.wasi().open.insert(
+                4,
+                OpenFile {
+                    path: "out".into(),
+                    offset: 1,
+                    writable: true,
+                },
+            );
+            assert!(matches!(
+                runtime.call(name, &params).unwrap()[0],
+                Val::I32(EINVAL)
+            ));
+            let wasi = runtime.wasi();
+            assert_eq!(wasi.file("out"), Some([1, 2, 3, 4].as_slice()), "{name}");
+            assert_eq!(wasi.open[&4].offset, 1, "{name}");
+            assert_eq!(runtime.state().read(64, 3).unwrap(), [0x55; 3], "{name}");
+        }
+    }
 
     #[test]
     fn invalid_write_result_pointers_preserve_streams_files_and_offsets() {

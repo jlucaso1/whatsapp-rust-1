@@ -51,6 +51,10 @@ pub struct FuncSelector {
     /// Expected body fingerprint (see `unwasm_core::analysis::fingerprint`).
     /// When set, a changed body fails resolution instead of running.
     pub expect_fingerprint: Option<u64>,
+    /// SHA-256 of the encoded body, including locals; usable for short trampolines.
+    /// This exact-byte anchor must be re-derived when migrating to a new capture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_body_sha256: Option<String>,
 }
 
 /// Where `derive` resolves a selector.
@@ -402,6 +406,18 @@ pub(crate) fn probe_module_bytes() -> Vec<u8> {
     let mut funcs = FunctionSection::new();
     funcs.function(0);
     module.section(&funcs);
+    let mut memories = wasm_encoder::MemorySection::new();
+    memories.memory(wasm_encoder::MemoryType {
+        minimum: 1,
+        maximum: None,
+        memory64: false,
+        shared: false,
+        page_size_log2: None,
+    });
+    module.section(&memories);
+    let mut exports = wasm_encoder::ExportSection::new();
+    exports.export("memory", wasm_encoder::ExportKind::Memory, 0);
+    module.section(&exports);
     let mut code = CodeSection::new();
     // Long enough to fingerprint: bodies below FINGERPRINT_FLOOR collide and
     // carry refuses them, so an empty function would make every migration
@@ -468,6 +484,23 @@ fn resolve_one(
         );
     }
 
+    anyhow::ensure!(
+        selector
+            .must_hold_string
+            .as_ref()
+            .is_some_and(|value| !value.is_empty())
+            || selector.expect_fingerprint.is_some()
+            || selector.expect_body_sha256.is_some(),
+        "selector `{name}` needs a string, fingerprint or body hash; an index alone is not evidence"
+    );
+    if let Some(expected) = &selector.expect_body_sha256 {
+        let actual = function_body_sha256(bytes, hint)?;
+        anyhow::ensure!(
+            &actual == expected,
+            "selector `{name}` body hashes to {actual}, expected {expected}"
+        );
+    }
+
     if let Some(needle) = selector.must_hold_string.as_deref() {
         let refs = crate::abi::find_string_refs(bytes, needle)?;
         let holders: Vec<u32> = refs
@@ -502,6 +535,38 @@ fn resolve_one(
         slots,
         fingerprint,
     })
+}
+
+/// SHA-256 of one defined function's encoded body, including local declarations.
+/// Unlike a migration fingerprint, this also distinguishes short bodies exactly.
+pub fn function_body_sha256(bytes: &[u8], function: u32) -> Result<String> {
+    let mut index = 0u32;
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        match payload? {
+            wasmparser::Payload::ImportSection(imports) => {
+                for import in imports.into_imports() {
+                    if matches!(
+                        import?.ty,
+                        wasmparser::TypeRef::Func(_) | wasmparser::TypeRef::FuncExact(_)
+                    ) {
+                        index = index.checked_add(1).context("function index overflow")?;
+                    }
+                }
+                anyhow::ensure!(
+                    function >= index,
+                    "function {function} is an import without a body"
+                );
+            }
+            wasmparser::Payload::CodeSectionEntry(body) => {
+                if index == function {
+                    return Ok(sha256_hex(&bytes[body.range()]));
+                }
+                index = index.checked_add(1).context("function index overflow")?;
+            }
+            _ => {}
+        }
+    }
+    anyhow::bail!("function {function} has no body")
 }
 
 /// Body fingerprint of one function, or `None` when it is too short to hash
@@ -951,7 +1016,12 @@ impl Step {
                 Ok(())
             }
             Step::Fill { ptr, at, len, byte } => {
+                anyhow::ensure!(*len <= 64 * 1024 * 1024, "fill budget exceeded (64 MiB)");
                 let address = executor.ptr_at(ptr, *at)?;
+                executor
+                    .live()?
+                    .state()
+                    .ensure_memory_range(address, *len)?;
                 executor
                     .live()?
                     .write_bytes_at(address, &vec![*byte; *len as usize])?;
@@ -1217,6 +1287,66 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_body_hash_rejects_changed_code() {
+        let bytes = probe_module();
+        let selector = FuncSelector {
+            index_hint: 0,
+            must_hold_string: None,
+            expect_fingerprint: None,
+            expect_body_sha256: Some(function_body_sha256(&bytes, 0).unwrap()),
+        };
+        assert!(resolve_one(&bytes, "probe", &selector, 1).is_ok());
+        let mut changed = bytes.clone();
+        let body = wasmparser::Parser::new(0)
+            .parse_all(&bytes)
+            .find_map(|payload| {
+                if let Ok(wasmparser::Payload::CodeSectionEntry(body)) = payload {
+                    Some(body.range())
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        changed[body.start + 1] = 0x00; // Replace nop with unreachable, preserving a valid body.
+        assert!(resolve_one(&changed, "probe", &selector, 1).is_err());
+    }
+
+    #[test]
+    fn a_bare_index_is_not_selector_evidence() {
+        let bytes = probe_module();
+        let selector = FuncSelector {
+            index_hint: 0,
+            must_hold_string: None,
+            expect_fingerprint: None,
+            expect_body_sha256: None,
+        };
+        assert!(
+            resolve_one(
+                &bytes,
+                "unverified",
+                &selector,
+                crate::abi::function_count(&bytes).unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn fills_have_a_budget_before_allocating() {
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = probe_module();
+        let spec: Spec = serde_json::from_value(serde_json::json!({
+            "module":{"id":"probe","sha256":"","size":0},
+            "steps":[{"op":"instantiate"},{"op":"fill","ptr":0,"len":67_108_865,"byte":0}]
+        }))
+        .unwrap();
+        let error = Executor::new(directory.path())
+            .execute(&bytes, &spec, &BTreeMap::new())
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("fill budget"), "{error:#}");
+    }
+
+    #[test]
     fn manifest_paths_are_rejected_before_writing_outputs() {
         for path in ["manifest.json", "manifest.json/child", "MANIFEST.JSON"] {
             let directory = tempfile::tempdir().unwrap();
@@ -1438,6 +1568,7 @@ mod tests {
             index_hint: 0,
             must_hold_string: None,
             expect_fingerprint: None,
+            expect_body_sha256: Some(function_body_sha256(&bytes, 0).unwrap()),
         };
         let resolved = resolve_one(&bytes, "probe", &good, count).expect("resolve");
         assert_eq!(resolved.index, 0);
@@ -1447,6 +1578,7 @@ mod tests {
             index_hint: 7,
             must_hold_string: None,
             expect_fingerprint: None,
+            expect_body_sha256: None,
         };
         let error = resolve_one(&bytes, "probe", &bad, count).unwrap_err();
         assert!(
@@ -1499,6 +1631,7 @@ mod tests {
             index_hint: 0,
             must_hold_string: Some("no-such-string".to_owned()),
             expect_fingerprint: None,
+            expect_body_sha256: None,
         };
         let error = resolve_one(&bytes, "probe", &selector, count).unwrap_err();
         assert!(

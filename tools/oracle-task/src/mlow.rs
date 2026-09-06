@@ -368,6 +368,42 @@ fn source_newer(directory: &Path, modified: std::time::SystemTime) -> Result<boo
     }
     Ok(false)
 }
+fn verify_reference(reference: &Path, expected: &str) -> Result<()> {
+    let output = capture(
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(reference),
+    )
+    .context("C reference must be a Git checkout at the pinned revision")?;
+    let revision = String::from_utf8(output.stdout)?;
+    ensure!(
+        revision.trim() == expected,
+        "C reference revision {} differs from pinned {expected}",
+        revision.trim()
+    );
+    let toplevel = capture(
+        Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .current_dir(reference),
+    )?;
+    let toplevel = String::from_utf8(toplevel.stdout)?;
+    ensure!(
+        Path::new(toplevel.trim()).canonicalize()? == reference.canonicalize()?,
+        "C reference must name the checkout root"
+    );
+    let dirty = capture(
+        Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(reference),
+    )?
+    .stdout;
+    ensure!(
+        dirty.is_empty() || std::env::var("MLOW_ALLOW_DIRTY_REFERENCE").as_deref() == Ok("1"),
+        "reference is dirty; set MLOW_ALLOW_DIRTY_REFERENCE=1 only for an intentional modified oracle"
+    );
+    Ok(())
+}
+
 fn c_reference(root: &Path, check: bool) -> Result<()> {
     let reference = PathBuf::from(
         std::env::var_os("MLOW_REFERENCE")
@@ -376,31 +412,7 @@ fn c_reference(root: &Path, check: bool) -> Result<()> {
     .canonicalize()?;
     let lib = reference.join(".libs/libopus.a");
     ensure!(lib.is_file(), "build the C reference first");
-    if let Ok(output) = capture(
-        Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(&reference),
-    ) {
-        let revision = String::from_utf8(output.stdout)?;
-        let dirty = capture(
-            Command::new("git")
-                .args(["status", "--porcelain"])
-                .current_dir(&reference),
-        )?
-        .stdout;
-        ensure!(
-            dirty.is_empty() || std::env::var("MLOW_ALLOW_DIRTY_REFERENCE").as_deref() == Ok("1"),
-            "reference is dirty; set MLOW_ALLOW_DIRTY_REFERENCE=1 only for an intentional modified oracle"
-        );
-        if revision.trim() != "84b076e0809412df22e8a0d26f944610c4a3e40f" {
-            eprintln!(
-                "reference revision differs from the archived oracle: {}",
-                revision.trim()
-            );
-        }
-    } else {
-        eprintln!("reference revision could not be identified");
-    }
+    verify_reference(&reference, "84b076e0809412df22e8a0d26f944610c4a3e40f")?;
     let modified = std::fs::metadata(&lib)?.modified()?;
     for name in ["smpl", "src", "celt"] {
         ensure!(
@@ -408,7 +420,9 @@ fn c_reference(root: &Path, check: bool) -> Result<()> {
             "reference library is older than its sources; rebuild it"
         );
     }
-    let work = tempfile::tempdir()?;
+    let cache = root.join(".cache");
+    std::fs::create_dir_all(&cache)?;
+    let work = tempfile::tempdir_in(cache)?;
     let binary = work.path().join("mlow_frames");
     let mut cc = Command::new("cc");
     cc.arg("-O2");
@@ -545,6 +559,59 @@ pub fn run(root: &Path, task: Task) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn c_reference_requires_a_git_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(
+            verify_reference(directory.path(), "84b076e0809412df22e8a0d26f944610c4a3e40f").is_err()
+        );
+    }
+
+    #[test]
+    fn c_reference_requires_the_pinned_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        execute(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(directory.path()),
+        )
+        .unwrap();
+        execute(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "commit",
+                    "--quiet",
+                    "--allow-empty",
+                    "-m",
+                    "fixture",
+                ])
+                .current_dir(directory.path()),
+        )
+        .unwrap();
+        let revision = String::from_utf8(
+            capture(
+                Command::new("git")
+                    .args(["rev-parse", "HEAD"])
+                    .current_dir(directory.path()),
+            )
+            .unwrap()
+            .stdout,
+        )
+        .unwrap();
+        assert!(verify_reference(directory.path(), revision.trim()).is_ok());
+        assert!(
+            verify_reference(directory.path(), "84b076e0809412df22e8a0d26f944610c4a3e40f").is_err()
+        );
+    }
 
     #[test]
     fn archive_metadata_describes_the_committed_representation() {

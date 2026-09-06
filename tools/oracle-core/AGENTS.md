@@ -19,6 +19,8 @@ for the coverage boundary. Historical experiments live in
 - Fetch with `cargo xt oracle fetch`. `WA_WASM_DIR` overrides `.cache/wa-wasm`.
   Missing implicit captures may skip locally; corrupt captures and explicit
   overrides must fail. A run printing `skipping:` is not conformance evidence.
+- Selectors require a string anchor, fingerprint or exact encoded-body hash.
+  An index alone is not evidence, including for short initialization trampolines.
 - `wasm.lock.json` pins exact hashes. A capture bump requires re-deriving
   indices, addresses, selectors and expectations together. Never commit wasms.
 

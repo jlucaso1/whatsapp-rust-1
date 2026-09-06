@@ -146,6 +146,9 @@ enum Command {
         /// body rather than just its summary.
         #[arg(long, default_value_t = 24)]
         body: usize,
+        /// Print the exact encoded-body SHA-256 for a reviewed selector index.
+        #[arg(long, requires = "index", conflicts_with_all = ["slot", "filter"])]
+        body_sha256: bool,
     },
     /// Find the code that reaches for a given string.
     ///
@@ -342,7 +345,16 @@ fn main() -> Result<()> {
             slot,
             index,
             body,
-        } => abi(&catalog, &target, filter.as_deref(), slot, index, body),
+            body_sha256,
+        } => abi(
+            &catalog,
+            &target,
+            filter.as_deref(),
+            slot,
+            index,
+            body,
+            body_sha256,
+        ),
         Command::Embind {
             target,
             full,
@@ -858,9 +870,20 @@ fn abi(
     slot: Option<u32>,
     index: Option<u32>,
     body: usize,
+    body_sha256: bool,
 ) -> Result<()> {
     let module = catalog.resolve(target)?;
     let bytes = std::fs::read(&module.path)?;
+    if body_sha256 {
+        println!(
+            "{}",
+            oracle_core::derive::function_body_sha256(
+                &bytes,
+                index.context("--body-sha256 requires --index")?
+            )?
+        );
+        return Ok(());
+    }
     oracle_core::abi::set_body_limit(body);
 
     if let Some(index) = index {
