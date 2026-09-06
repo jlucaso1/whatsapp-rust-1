@@ -7752,6 +7752,7 @@ mod read_routing_tests {
                         "self.pool",
                         "with_semaphore(",
                         "with_retry(",
+                        "with_read_retry(",
                         "spawn_blocking(",
                         // The sibling-crate write path; `shared().read(` is the
                         // read one and is what `read_query` itself uses.
