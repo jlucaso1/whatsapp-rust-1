@@ -1611,8 +1611,6 @@ impl SqliteStore {
                 })
                 .await;
 
-            drop(permit);
-
             match result {
                 Ok(Ok(())) => {
                     self.await_commit_barrier().await?;
@@ -1621,6 +1619,7 @@ impl SqliteStore {
                 Ok(Err(DieselOrStore::Diesel(ref e)))
                     if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
                 {
+                    drop(permit);
                     let delay_ms = 10 * 2u64.pow(attempt);
                     warn!(
                         "Identity write failed (attempt {}/{}): {e}. Retrying in {delay_ms}ms...",
@@ -1630,7 +1629,10 @@ impl SqliteStore {
                     retry_backoff(delay_ms).await;
                     continue;
                 }
-                Ok(Err(e)) => return Err(e.into()),
+                Ok(Err(e)) => {
+                    drop(permit);
+                    return Err(e.into());
+                }
                 Err(e) => return Err(StoreError::Database(Box::new(e))),
             }
         }
@@ -1737,8 +1739,6 @@ impl SqliteStore {
                 })
                 .await;
 
-            drop(permit);
-
             match result {
                 Ok(Ok(())) => {
                     self.await_commit_barrier().await?;
@@ -1747,6 +1747,7 @@ impl SqliteStore {
                 Ok(Err(DieselOrStore::Diesel(ref e)))
                     if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
                 {
+                    drop(permit);
                     let delay_ms = 10 * 2u64.pow(attempt);
                     warn!(
                         "Session write failed (attempt {}/{}): {e}. Retrying in {delay_ms}ms...",
@@ -1756,7 +1757,10 @@ impl SqliteStore {
                     retry_backoff(delay_ms).await;
                     continue;
                 }
-                Ok(Err(e)) => return Err(e.into()),
+                Ok(Err(e)) => {
+                    drop(permit);
+                    return Err(e.into());
+                }
                 Err(e) => return Err(StoreError::Database(Box::new(e))),
             }
         }
@@ -2469,8 +2473,6 @@ impl SignalStore for SqliteStore {
                 })
                 .await;
 
-            drop(permit);
-
             match result {
                 Ok(Ok(())) => {
                     self.await_commit_barrier().await?;
@@ -2479,10 +2481,14 @@ impl SignalStore for SqliteStore {
                 Ok(Err(DieselOrStore::Diesel(ref e)))
                     if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
                 {
+                    drop(permit);
                     let delay_ms = 10u64 * (1u64 << attempt.min(4));
                     retry_backoff(delay_ms).await;
                 }
-                Ok(Err(e)) => return Err(e.into()),
+                Ok(Err(e)) => {
+                    drop(permit);
+                    return Err(e.into());
+                }
                 Err(e) => return Err(StoreError::Database(Box::new(e))),
             }
         }
@@ -2602,8 +2608,6 @@ impl SignalStore for SqliteStore {
                 })
                 .await;
 
-            drop(permit);
-
             match result {
                 Ok(Ok(())) => {
                     self.await_commit_barrier().await?;
@@ -2612,10 +2616,14 @@ impl SignalStore for SqliteStore {
                 Ok(Err(DieselOrStore::Diesel(ref e)))
                     if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
                 {
+                    drop(permit);
                     let delay_ms = 10u64 * (1u64 << attempt.min(4));
                     retry_backoff(delay_ms).await;
                 }
-                Ok(Err(e)) => return Err(e.into()),
+                Ok(Err(e)) => {
+                    drop(permit);
+                    return Err(e.into());
+                }
                 Err(e) => return Err(StoreError::Database(Box::new(e))),
             }
         }
@@ -2732,8 +2740,6 @@ impl SignalStore for SqliteStore {
                 })
                 .await;
 
-            drop(permit);
-
             match result {
                 Ok(Ok(())) => {
                     self.await_commit_barrier().await?;
@@ -2742,10 +2748,14 @@ impl SignalStore for SqliteStore {
                 Ok(Err(DieselOrStore::Diesel(ref e)))
                     if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
                 {
+                    drop(permit);
                     let delay_ms = 10u64 * (1u64 << attempt.min(4));
                     retry_backoff(delay_ms).await;
                 }
-                Ok(Err(e)) => return Err(e.into()),
+                Ok(Err(e)) => {
+                    drop(permit);
+                    return Err(e.into());
+                }
                 Err(e) => return Err(StoreError::Database(Box::new(e))),
             }
         }
@@ -2818,8 +2828,6 @@ impl SignalStore for SqliteStore {
                 })
                 .await;
 
-            drop(permit);
-
             match result {
                 Ok(Ok(())) => {
                     self.await_commit_barrier().await?;
@@ -2828,10 +2836,14 @@ impl SignalStore for SqliteStore {
                 Ok(Err(DieselOrStore::Diesel(ref e)))
                     if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
                 {
+                    drop(permit);
                     let delay_ms = 10u64 * (1u64 << attempt.min(4));
                     retry_backoff(delay_ms).await;
                 }
-                Ok(Err(e)) => return Err(e.into()),
+                Ok(Err(e)) => {
+                    drop(permit);
+                    return Err(e.into());
+                }
                 Err(e) => return Err(StoreError::Database(Box::new(e))),
             }
         }
